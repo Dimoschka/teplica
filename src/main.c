@@ -21,6 +21,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
+#include <string.h>
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -588,9 +589,55 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
  * ======================================================================== */
 
 /**
+ * @brief Проверка наличия критических конфигурационных параметров
+ * @return true если все параметры указаны, false если какой-то пуст
+ */
+static bool validate_credentials(void) {
+    bool valid = true;
+    
+    // Проверка Wi-Fi credentials
+    if (strlen(WIFI_SSID) == 0) {
+        ESP_LOGE(MAIN_TAG, "❌ WIFI_SSID не установлен в config.h");
+        valid = false;
+    }
+    if (strlen(WIFI_PASS) == 0) {
+        ESP_LOGE(MAIN_TAG, "❌ WIFI_PASS не установлен в config.h");
+        valid = false;
+    }
+    
+    // Проверка MQTT credentials
+    if (strlen(CONFIG_MQTT_BROKER) == 0) {
+        ESP_LOGE(MAIN_TAG, "❌ CONFIG_MQTT_BROKER не установлен в config.h");
+        valid = false;
+    }
+    if (strlen(CONFIG_MQTT_PASS) == 0) {
+        ESP_LOGE(MAIN_TAG, "❌ CONFIG_MQTT_PASS не установлен в config.h");
+        valid = false;
+    }
+    
+    if (!valid) {
+        ESP_LOGE(MAIN_TAG, "⛔ ОШИБКА: Не все необходимые параметры конфигурации установлены!");
+        ESP_LOGE(MAIN_TAG, "   Отредактируйте include/config.h и установите:");
+        ESP_LOGE(MAIN_TAG, "   - WIFI_SSID и WIFI_PASS");
+        ESP_LOGE(MAIN_TAG, "   - CONFIG_MQTT_BROKER и CONFIG_MQTT_PASS");
+    }
+    
+    return valid;
+}
+
+/**
  * @brief Точка входа приложения
  */
 void app_main() {
+    // === Проверка обязательных конфигурационных параметров ===
+    if (!validate_credentials()) {
+        ESP_LOGE(MAIN_TAG, "⛔ Приложение остановлено: недостаточно данных конфигурации");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+    
+    ESP_LOGI(MAIN_TAG, "✓ Конфигурация проверена успешно");
+
     // === Инициализация датчика тока ===
     acs712_init(&current_sensor, ADC_CHANNEL_0, 66.0f, ADC_BITWIDTH_DEFAULT, ADC_ATTEN_DB_12);
     acs712_begin(&current_sensor);

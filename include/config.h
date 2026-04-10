@@ -20,11 +20,11 @@ extern "C" {
 // Основная сеть
 
 #if Change_WiFi_MQTT == 1
-#define WIFI_SSID           "ZCM2"
-#define WIFI_PASS           "ZavodSpecMash17"
+#define WIFI_SSID           ""             // Замените на реальный SSID при запуске
+#define WIFI_PASS           ""              // Замените на реальный пароль при запуске
 #else
-#define WIFI_SSID          "Sweet_Home"
-#define WIFI_PASS          "F4emz75L"
+#define WIFI_SSID          ""
+#define WIFI_PASS          ""
 #endif
 // Максимальное количество попыток подключения
 #define WIFI_MAX_RETRIES    5
@@ -52,15 +52,15 @@ extern "C" {
 // Брокер
 
 #if Change_WiFi_MQTT == 1
-#define CONFIG_MQTT_BROKER      "192.168.126.230"
+#define CONFIG_MQTT_BROKER      "" // Замените на реальный IP при запуске    
 #define CONFIG_MQTT_PORT        1885
-#define CONFIG_MQTT_USER        "mqtt_client"
-#define CONFIG_MQTT_PASS        "qwer1234"
+#define CONFIG_MQTT_USER        ""     // Замените на реального пользователя при запуске
+#define CONFIG_MQTT_PASS        ""        // Замените на реальный пароль при запуске
 #else
-#define CONFIG_MQTT_BROKER       "192.168.100.100"
+#define CONFIG_MQTT_BROKER       "" // Замените на реальный IP при запуске
 #define CONFIG_MQTT_PORT         1883
-#define CONFIG_MQTT_USER         "mqtt"
-#define CONFIG_MQTT_PASS         "mqtt"
+#define CONFIG_MQTT_USER         ""    // Замените на реального пользователя при запуске
+#define CONFIG_MQTT_PASS         ""        // Замените на реальный пароль при запуске
 #endif
 #define CONFIG_MQTT_CLIENT_ID   "greenhouse_controller"
 

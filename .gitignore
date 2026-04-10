@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+# В .gitignore добавьте:
+include/config.h  # Или конкретные файлы с паролями
+*.env             # Если используете .env файлы
+secrets/          # Папка с секретами
