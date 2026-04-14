@@ -83,6 +83,7 @@ static acs712_t current_sensor;
 static pwm_load_handle_t g_pump_pwm = NULL;
 static adc_oneshot_unit_handle_t g_adc1_handle = NULL;
 static adc_cali_handle_t g_cali_handle = NULL;
+static sht30_t sht30_dev;
 
 // Состояние форточки
 static vent_state_t g_vent_state = VENT_CLOSED;
@@ -408,15 +409,8 @@ static void ventilation_task(void *arg) {
  * @brief Читает данные SHT30 и отправляет в очередь управления
  */
 static void climate_control_task(void *arg) {
-    sht30_t dev;
-    if (sht30_init(&dev, SHT30_I2C_PORT, SHT30_SDA_PIN, SHT30_SCL_PIN, SHT30_ADDR_DEFAULT) != ESP_OK) {
-        ESP_LOGE(MAIN_TAG, "SHT30 init failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
     while (1) {
-        if (sht30_read_temperature_humidity(&dev, &g_temperature, &g_humidity) == ESP_OK) {
+        if (sht30_read_temperature_humidity(&sht30_dev, &g_temperature, &g_humidity) == ESP_OK) {
             ESP_LOGI(MAIN_TAG, "T=%.2f°C H=%.2f%%", g_temperature, g_humidity);
 
             climate_data_t data = { .temperature = g_temperature, .humidity = g_humidity };
@@ -426,7 +420,7 @@ static void climate_control_task(void *arg) {
         } else {
             ESP_LOGE(MAIN_TAG, "Failed to read SHT30");
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(SHT30_MEASUREMENT_PERIOD_MS));
     }
     vTaskDelete(NULL);
 }
@@ -691,9 +685,14 @@ void app_main() {
         return;
     }
 
-     // === Инициализация насоса и ADC ===
-    if (init_water_pump() != ESP_OK) return;
+     // === Инициализация ADC для уровня воды ===
     if (init_water_level_sensor() != ESP_OK) return;
+
+    // === Инициализация SHT30 ===
+    if (sht30_init(&sht30_dev, SHT30_I2C_PORT, SHT30_SDA_PIN, SHT30_SCL_PIN, SHT30_ADDR_DEFAULT) != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Failed to initialize SHT30");
+        return;
+    }
 
     // === Запуск задач ===
     xTaskCreate(ventilation_task, "ventilation", 2048, NULL, 6, &g_ventilation_task_handle);

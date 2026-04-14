@@ -33,6 +33,10 @@ esp_err_t sht30_init(sht30_t *dev, i2c_port_t port, gpio_num_t sda, gpio_num_t s
     dev->scl_pin = scl;
     dev->address = address;
 
+    // Reset GPIO pins
+    gpio_reset_pin(dev->sda_pin);
+    gpio_reset_pin(dev->scl_pin);
+
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = dev->sda_pin,
@@ -67,10 +71,10 @@ esp_err_t sht30_read_temperature_humidity(sht30_t *dev, float *temperature_c, fl
         return ESP_ERR_INVALID_ARG;
     }
 
-    // measurement command high repeatability, clock stretching disabled
-    const uint8_t cmd[2] = {0x2C, 0x06};
+    // measurement command high repeatability, clock stretching enabled
+    const uint8_t cmd[2] = {0x2C, 0x10};
 
-    esp_err_t err = i2c_master_write_to_device(dev->port, dev->address, cmd, sizeof(cmd), pdMS_TO_TICKS(1000));
+    esp_err_t err = i2c_master_write_to_device(dev->port, dev->address, cmd, sizeof(cmd), pdMS_TO_TICKS(2000));
     if (err != ESP_OK) {
         ESP_LOGE(SHT30_TAG, "write cmd failed: %s", esp_err_to_name(err));
         return err;
@@ -80,7 +84,7 @@ esp_err_t sht30_read_temperature_humidity(sht30_t *dev, float *temperature_c, fl
     vTaskDelay(pdMS_TO_TICKS(15));
 
     uint8_t data[6];
-    err = i2c_master_read_from_device(dev->port, dev->address, data, sizeof(data), pdMS_TO_TICKS(1000));
+    err = i2c_master_read_from_device(dev->port, dev->address, data, sizeof(data), pdMS_TO_TICKS(2000));
     if (err != ESP_OK) {
         ESP_LOGE(SHT30_TAG, "read data failed: %s", esp_err_to_name(err));
         return err;
@@ -88,7 +92,7 @@ esp_err_t sht30_read_temperature_humidity(sht30_t *dev, float *temperature_c, fl
 
     // validate CRCs
     if (sht30_crc8(data, 2) != data[2] || sht30_crc8(data + 3, 2) != data[5]) {
-        ESP_LOGW(SHT30_TAG, "CRC mismatch");
+        ESP_LOGW(SHT30_TAG, "CRC mismatch: data[2]=%02X calc=%02X, data[5]=%02X calc=%02X", data[2], sht30_crc8(data, 2), data[5], sht30_crc8(data + 3, 2));
         return ESP_ERR_INVALID_CRC;
     }
 

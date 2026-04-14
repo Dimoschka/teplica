@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 
-#define Change_WiFi_MQTT 0 // 0 - для домашней сети, 1 - для завода
+
 
 // ========================================
 // === Wi-Fi Настройки ====================
@@ -19,13 +19,10 @@ extern "C" {
 
 // Основная сеть
 
-#if Change_WiFi_MQTT == 1
-#define WIFI_SSID           ""             // Замените на реальный SSID при запуске
-#define WIFI_PASS           ""              // Замените на реальный пароль при запуске
-#else
-#define WIFI_SSID          ""
-#define WIFI_PASS          ""
-#endif
+
+#define WIFI_SSID           "trqrt"             // Замените на реальный SSID при запуске
+#define WIFI_PASS           "rtewert"              // Замените на реальный пароль при запуске
+
 // Максимальное количество попыток подключения
 #define WIFI_MAX_RETRIES    5
 
@@ -51,17 +48,13 @@ extern "C" {
 
 // Брокер
 
-#if Change_WiFi_MQTT == 1
-#define CONFIG_MQTT_BROKER      "" // Замените на реальный IP при запуске    
-#define CONFIG_MQTT_PORT        1885
-#define CONFIG_MQTT_USER        ""     // Замените на реального пользователя при запуске
-#define CONFIG_MQTT_PASS        ""        // Замените на реальный пароль при запуске
-#else
-#define CONFIG_MQTT_BROKER       "" // Замените на реальный IP при запуске
+
+
+#define CONFIG_MQTT_BROKER       "192.168.100.100" // Замените на реальный IP при запуске
 #define CONFIG_MQTT_PORT         1883
-#define CONFIG_MQTT_USER         ""    // Замените на реального пользователя при запуске
-#define CONFIG_MQTT_PASS         ""        // Замените на реальный пароль при запуске
-#endif
+#define CONFIG_MQTT_USER         "asdfa"    // Замените на реального пользователя при запуске
+#define CONFIG_MQTT_PASS         "asdf"        // Замените на реальный пароль при запуске
+
 #define CONFIG_MQTT_CLIENT_ID   "greenhouse_controller"
 
 // Топики
@@ -79,10 +72,11 @@ extern "C" {
 // === Датчик SHT30 =======================
 // ========================================
 
-#define SHT30_I2C_PORT      I2C_NUM_0
+#define SHT30_I2C_PORT      I2C_NUM_1
 #define SHT30_SDA_PIN       GPIO_NUM_21
 #define SHT30_SCL_PIN       GPIO_NUM_22
 #define SHT30_ADDR          SHT30_ADDR_DEFAULT
+#define SHT30_MEASUREMENT_PERIOD_MS 30000  // Период измерения температуры и влажности (30 секунд)
 
 
 // ========================================
