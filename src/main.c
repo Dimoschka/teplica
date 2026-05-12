@@ -18,13 +18,13 @@
 #include "sntp_d.h"
 #include "mqtt_d.h"
 #include "esp_log.h"
+#include "nvs_flash.h"
+#include "cJSON.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
 #include <string.h>
-#include "esp_adc/adc_oneshot.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
+#include "cJSON.h"
 
 
 
@@ -89,6 +89,14 @@ static sht30_t sht30_dev;
 static vent_state_t g_vent_state = VENT_CLOSED;
 static bool g_vent_position = false;  // false = закрыто, true = открыто
 
+// Настраиваемые параметры (сохранение в NVS)
+static float g_vent_open_temp = DEFAULT_VENT_OPEN_TEMP;
+static float g_vent_close_temp = DEFAULT_VENT_CLOSE_TEMP;
+static int g_irrigation_hour = DEFAULT_IRRIGATION_HOUR;
+static int g_fill_tank_start_hour = DEFAULT_FILL_TANK_START_HOUR;
+static int g_fill_tank_end_hour = DEFAULT_FILL_TANK_END_HOUR;
+static int g_irrigation_duration_s = DEFAULT_IRRIGATION_DURATION_S;
+
 /* ========================================================================
  * Вспомогательные функции для полива
  * ======================================================================== */
@@ -145,9 +153,10 @@ static esp_err_t init_water_level_sensor(void) {
 }
 
 /**
- * @brief Считывает уровень воды в процентах (0–100%)
+ * @brief Считывает напряжение датчика уровня воды в мВ
+ * @return Напряжение в мВ, -1 при ошибке чтения ADC
  */
-static int read_water_level_percent(void) {
+static int read_water_level_voltage_mv(void) {
     int raw;
     if (adc_oneshot_read(g_adc1_handle, WATER_LEVEL_ADC_CHAN, &raw) != ESP_OK) {
         ESP_LOGW(MAIN_TAG, "Ошибка чтения ADC уровня воды");
@@ -160,12 +169,45 @@ static int read_water_level_percent(void) {
         return -1;
     }
 
-    // Расчет количества активированных герконов (0-32)
-    int level_steps = (voltage_mv * 32 + WATER_LEVEL_FULL_MV / 2) / WATER_LEVEL_FULL_MV;
-    level_steps = CLAMP(level_steps, 0, 32);
+    return voltage_mv;
+}
 
-    // Преобразование в проценты с округлением
-    int percent = (level_steps * 100 + 16) / 32;  // 16 = 32/2 для округления
+/**
+ * @brief Считывает уровень воды в процентах (0–100%)
+ * @return Уровень в процентах, -1 при отключенном датчике или ошибке
+ */
+static int read_water_level_percent(void) {
+    int voltage_mv = read_water_level_voltage_mv();
+    if (voltage_mv < 0) {
+        return -1;  // Ошибка чтения
+    }
+
+    if (voltage_mv == 0) {
+        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (0 мВ)");
+        return -1;  // Отключенный датчик
+    }
+
+    // Градиент погрешности: если напряжение в зоне пустого бака с погрешностью, считаем пустым
+    if (voltage_mv <= WATER_LEVEL_EMPTY_MV + WATER_LEVEL_EMPTY_MARGIN_MV) {
+        return 0;
+    }
+
+    // Если напряжение в зоне полного бака с погрешностью, считаем полным
+    if (voltage_mv >= WATER_LEVEL_FULL_MV - WATER_LEVEL_FULL_MARGIN_MV) {
+        return 100;
+    }
+
+    // Линейная интерполяция между зонами с погрешностью
+    int empty_with_margin = WATER_LEVEL_EMPTY_MV + WATER_LEVEL_EMPTY_MARGIN_MV;
+    int full_with_margin = WATER_LEVEL_FULL_MV - WATER_LEVEL_FULL_MARGIN_MV;
+    int range_mv = full_with_margin - empty_with_margin;
+
+    if (range_mv <= 0) {
+        ESP_LOGE(MAIN_TAG, "Некорректные настройки датчика уровня воды");
+        return -1;
+    }
+
+    int percent = ((voltage_mv - empty_with_margin) * 100) / range_mv;
     return CLAMP(percent, 0, 100);
 }
 
@@ -221,6 +263,68 @@ static void stop_tank_fill(void) {
  * ======================================================================== */
 
 /**
+ * @brief Загружает настройки из NVS, если нет — использует дефолты
+ */
+static void load_settings_from_nvs(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("settings", NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(MAIN_TAG, "NVS не открыт для чтения, используем дефолты: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Загрузка температур (хранятся как int * 100)
+    int32_t temp;
+    if (nvs_get_i32(nvs_handle, "vent_open_temp", &temp) == ESP_OK) {
+        g_vent_open_temp = temp / 100.0f;
+    }
+    if (nvs_get_i32(nvs_handle, "vent_close_temp", &temp) == ESP_OK) {
+        g_vent_close_temp = temp / 100.0f;
+    }
+
+    // Загрузка времени (часы)
+    if (nvs_get_i32(nvs_handle, "irrigation_hour", &temp) == ESP_OK) {
+        g_irrigation_hour = temp;
+    }
+    if (nvs_get_i32(nvs_handle, "fill_start_hour", &temp) == ESP_OK) {
+        g_fill_tank_start_hour = temp;
+    }
+    if (nvs_get_i32(nvs_handle, "fill_end_hour", &temp) == ESP_OK) {
+        g_fill_tank_end_hour = temp;
+    }
+
+    // Загрузка длительности (секунды)
+    if (nvs_get_i32(nvs_handle, "irrigation_dur", &temp) == ESP_OK) {
+        g_irrigation_duration_s = temp;
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(MAIN_TAG, "Настройки загружены из NVS");
+}
+
+/**
+ * @brief Сохраняет настройку в NVS
+ */
+static void save_setting_to_nvs(const char* key, int32_t value) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("settings", NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Не удалось открыть NVS для записи: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_i32(nvs_handle, key, value);
+    if (err != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Не удалось сохранить настройку %s: %s", key, esp_err_to_name(err));
+    } else {
+        nvs_commit(nvs_handle);
+        ESP_LOGI(MAIN_TAG, "Настройка %s сохранена: %ld", key, value);
+    }
+
+    nvs_close(nvs_handle);
+}
+
+/**
  * @brief Проверяет ток двигателя. Если превышает допустимый — возвращает true
  * @param sensor Указатель на датчик ACS712
  * @return true если ток > MAX_ALLOWED_CURRENT
@@ -263,39 +367,75 @@ static void irrigation_task(void *arg) {
         }
 
         // 🔹 Наполнение бака днём (если ещё не заполняли и уровень низкий)
+        int level = read_water_level_percent();
         if (!g_tank_filled &&
-            hour >= FILL_TANK_START_HOUR && hour <= FILL_TANK_END_HOUR &&
-            read_water_level_percent() < 20) {
+            hour >= g_fill_tank_start_hour && hour <= g_fill_tank_end_hour &&
+            level >= 0 && level < 20) {
+            ESP_LOGI("IRRIG", "Запуск наполнения бака (уровень %d%%)", level);
             start_tank_fill();
-            vTaskDelay(pdMS_TO_TICKS(30000)); // Работает 30 секунд
+
+            // Мониторинг наполнения с проверкой датчика
+            bool fill_aborted = false;
+            for (int i = 0; i < 30; i++) {  // 30 секунд
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                int current_level = read_water_level_percent();
+                if (current_level < 0) {
+                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время наполнения бака, прерываем");
+                    fill_aborted = true;
+                    break;
+                }
+            }
+
             stop_tank_fill();
-            g_tank_filled = true;
-            ESP_LOGI("IRRIG", "Бак наполнен");
+            if (!fill_aborted) {
+                g_tank_filled = true;
+                ESP_LOGI("IRRIG", "Бак наполнен");
+            }
+        } else if (level < 0) {
+            ESP_LOGW("IRRIG", "Невозможно проверить уровень воды: датчик отключен");
         }
 
         // 🔹 Автоматический полив вечером
         if (!g_irrigation_done &&
-            hour == IRRIGATION_HOUR && timeinfo.tm_min == 0 && timeinfo.tm_sec < 5) {
+            hour == g_irrigation_hour && timeinfo.tm_min == 0 && timeinfo.tm_sec < 5) {
             int level = read_water_level_percent();
-            if (level < 30) {
+            if (level < 0) {
+                ESP_LOGW("IRRIG", "❗ Датчик уровня воды отключен, полив пропущен");
+            } else if (level < 30) {
                 ESP_LOGW("IRRIG", "❗ Уровень воды низкий (%d%%), полив пропущен", level);
             } else {
-                ESP_LOGI("IRRIG", "🌿 Запуск автоматического полива");
+                ESP_LOGI("IRRIG", "🌿 Запуск автоматического полива (уровень %d%%)", level);
 
                 open_valve(VALVE_GARDEN1_GPIO);
                 open_valve(VALVE_GARDEN2_GPIO);
                 open_valve(VALVE_GARDEN3_GPIO);
                 start_pump(PUMP_MAX_DUTY * 0.8);  // 80%
 
-                vTaskDelay(pdMS_TO_TICKS(IRRIGATION_DURATION_S * 1000));
+                // Мониторинг полива с проверкой датчика каждые 30 секунд
+                bool irrigation_aborted = false;
+                int duration_remaining = g_irrigation_duration_s;
+                while (duration_remaining > 0) {
+                    int check_interval = (duration_remaining > 30) ? 30 : duration_remaining;
+                    vTaskDelay(pdMS_TO_TICKS(check_interval * 1000));
+                    duration_remaining -= check_interval;
+
+                    int current_level = read_water_level_percent();
+                    if (current_level < 0) {
+                        ESP_LOGW("IRRIG", "Датчик уровня отключен во время полива, прерываем");
+                        irrigation_aborted = true;
+                        break;
+                    }
+                }
 
                 stop_pump();
                 close_valve(VALVE_GARDEN1_GPIO);
                 close_valve(VALVE_GARDEN2_GPIO);
                 close_valve(VALVE_GARDEN3_GPIO);
 
-                g_irrigation_done = true;
-                ESP_LOGI("IRRIG", "✅ Полив завершён");
+                if (!irrigation_aborted) {
+                    g_irrigation_done = true;
+                    ESP_LOGI("IRRIG", "✅ Полив завершён");
+                }
             }
         }
 
@@ -312,8 +452,8 @@ static void ventilation_task(void *arg) {
         climate_data_t data;
         if (xQueueReceive(g_climate_queue, &data, portMAX_DELAY) != pdPASS) continue;
 
-        bool should_be_open = (data.temperature >= VENT_OPEN_TEMP);
-        bool should_be_closed = (data.temperature <= VENT_CLOSE_TEMP);
+        bool should_be_open = (data.temperature >= g_vent_open_temp);
+        bool should_be_closed = (data.temperature <= g_vent_close_temp);
 
         ESP_LOGI(TAG_VENT, "T=%.2f°C | Форточка: %s | Цель: %s",
                  data.temperature,
@@ -336,7 +476,7 @@ static void ventilation_task(void *arg) {
         if (should_be_open && !g_vent_position) {
             ESP_LOGI(TAG_VENT, "🔥 Открываем форточку — плавный старт двигателя");
 
-            gpio_set_level(VENT_RELAY_GPIO, 1);
+            gpio_set_level(VENT_RELAY_GPIO, 0);
             pwm_load_ramp_to(g_motor_pwm, VENT_MOTOR_MAX_DUTY, VENT_RAMP_UP_TIME_MS, VENT_RAMP_STEPS);
             vTaskDelay(pdMS_TO_TICKS(VENT_RAMP_UP_TIME_MS));
 
@@ -371,7 +511,7 @@ static void ventilation_task(void *arg) {
         else if (should_be_closed && g_vent_position) {
             ESP_LOGI(TAG_VENT, "❄️ Закрываем форточку — плавный старт двигателя");
 
-            gpio_set_level(VENT_RELAY_GPIO, 0);
+            gpio_set_level(VENT_RELAY_GPIO, 1);
             pwm_load_ramp_to(g_motor_pwm, VENT_MOTOR_MAX_DUTY, VENT_RAMP_UP_TIME_MS, VENT_RAMP_STEPS);
             vTaskDelay(pdMS_TO_TICKS(VENT_RAMP_UP_TIME_MS));
 
@@ -436,6 +576,13 @@ static void mqtt_publish_task(void *pvParameters) {
             mqttd_publish_type(CONFIG_TOPIC_HUMID, TYPE_FLOAT, &g_humidity);
             const char *vent_state = g_vent_open ? "open" : "closed";
             mqttd_publish_type(CONFIG_TOPIC_VENT_STATE, TYPE_CHAR, vent_state);
+            int water_level = read_water_level_percent();
+            if (water_level < 0) {
+                ESP_LOGW(MAIN_TAG, "Публикация уровня воды пропущена: датчик отключен");
+                // Можно опубликовать -1 как индикатор ошибки
+                water_level = -1;
+            }
+            mqttd_publish_type(CONFIG_TOPIC_WATER_LEVEL, TYPE_INT, &water_level);
         }
         vTaskDelay(pdMS_TO_TICKS(10000)); // каждые 10 секунд
     }
@@ -548,24 +695,38 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
         ESP_LOGI("IRRIG", "Получена команда на ручной полив");
 
         int level = read_water_level_percent();
-        if (level < 30) {
-            ESP_LOGE("IRRIG", "❌ Полив невозможен: уровень воды %d%%", level);
-            mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_low_water");
+        if (level < 0) {
+            ESP_LOGE("IRRIG", "❌ Полив невозможен: датчик уровня воды отключен");
+            mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_sensor_disconnected");
         } else {
             open_valve(VALVE_GARDEN1_GPIO);
             open_valve(VALVE_GARDEN2_GPIO);
             open_valve(VALVE_GARDEN3_GPIO);
             start_pump(PUMP_MAX_DUTY * 0.8);
 
-            vTaskDelay(pdMS_TO_TICKS(60000)); // 1 минута
+            // Мониторинг ручного полива
+            bool irrigation_aborted = false;
+            for (int i = 0; i < 60; i++) {  // 60 секунд
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                int current_level = read_water_level_percent();
+                if (current_level < 0) {
+                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время ручного полива, прерываем");
+                    irrigation_aborted = true;
+                    break;
+                }
+            }
 
             stop_pump();
             close_valve(VALVE_GARDEN1_GPIO);
             close_valve(VALVE_GARDEN2_GPIO);
             close_valve(VALVE_GARDEN3_GPIO);
 
-            mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "done");
-            ESP_LOGI("IRRIG", "✅ Ручной полив завершён");
+            if (!irrigation_aborted) {
+                mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "done");
+                ESP_LOGI("IRRIG", "✅ Ручной полив завершён");
+            } else {
+                mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_sensor_disconnected");
+            }
         }
     }
     else if (strcmp(value, "fill_tank") == 0) {
@@ -574,6 +735,92 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
         vTaskDelay(pdMS_TO_TICKS(60000)); // 1 минута
         stop_tank_fill();
         mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "tank_filled");
+    }
+
+    // === Конфигурационные команды ===
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_VENT_OPEN_TEMP) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            float new_temp = cJSON_GetNumberValue(json);
+            if (new_temp >= 0 && new_temp <= 50) {
+                g_vent_open_temp = new_temp;
+                save_setting_to_nvs("vent_open_temp", (int32_t)(new_temp * 100));
+                ESP_LOGI(MAIN_TAG, "Температура открытия форточки установлена: %.1f°C", new_temp);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректная температура открытия: %.1f°C", new_temp);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_VENT_CLOSE_TEMP) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            float new_temp = cJSON_GetNumberValue(json);
+            if (new_temp >= 0 && new_temp <= 50) {
+                g_vent_close_temp = new_temp;
+                save_setting_to_nvs("vent_close_temp", (int32_t)(new_temp * 100));
+                ESP_LOGI(MAIN_TAG, "Температура закрытия форточки установлена: %.1f°C", new_temp);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректная температура закрытия: %.1f°C", new_temp);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            int new_hour = (int)cJSON_GetNumberValue(json);
+            if (new_hour >= 0 && new_hour <= 23) {
+                g_irrigation_hour = new_hour;
+                save_setting_to_nvs("irrigation_hour", new_hour);
+                ESP_LOGI(MAIN_TAG, "Час полива установлен: %d", new_hour);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректный час полива: %d", new_hour);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            int new_hour = (int)cJSON_GetNumberValue(json);
+            if (new_hour >= 0 && new_hour <= 23) {
+                g_fill_tank_start_hour = new_hour;
+                save_setting_to_nvs("fill_start_hour", new_hour);
+                ESP_LOGI(MAIN_TAG, "Час начала наполнения бака установлен: %d", new_hour);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректный час начала наполнения: %d", new_hour);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            int new_hour = (int)cJSON_GetNumberValue(json);
+            if (new_hour >= 0 && new_hour <= 23) {
+                g_fill_tank_end_hour = new_hour;
+                save_setting_to_nvs("fill_end_hour", new_hour);
+                ESP_LOGI(MAIN_TAG, "Час окончания наполнения бака установлен: %d", new_hour);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректный час окончания наполнения: %d", new_hour);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            int new_duration = (int)cJSON_GetNumberValue(json);
+            if (new_duration >= 0 && new_duration <= 3600) {
+                g_irrigation_duration_s = new_duration;
+                save_setting_to_nvs("irrigation_dur", new_duration);
+                ESP_LOGI(MAIN_TAG, "Длительность полива установлена: %d сек", new_duration);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректная длительность полива: %d сек", new_duration);
+            }
+        }
+        cJSON_Delete(json);
     }
 }
 
@@ -632,6 +879,9 @@ void app_main() {
     
     ESP_LOGI(MAIN_TAG, "✓ Конфигурация проверена успешно");
 
+    // === Загрузка настроек из NVS ===
+    load_settings_from_nvs();
+
     // === Инициализация датчика тока ===
     acs712_init(&current_sensor, ADC_CHANNEL_0, 66.0f, ADC_BITWIDTH_DEFAULT, ADC_ATTEN_DB_12);
     acs712_begin(&current_sensor);
@@ -676,7 +926,7 @@ void app_main() {
     // === Настройка реле ===
     gpio_reset_pin(VENT_RELAY_GPIO);
     gpio_set_direction(VENT_RELAY_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(VENT_RELAY_GPIO, 0);
+    gpio_set_level(VENT_RELAY_GPIO, 1);
 
     // === Очередь управления ===
     g_climate_queue = xQueueCreate(5, sizeof(climate_data_t));
@@ -688,7 +938,8 @@ void app_main() {
      // === Инициализация ADC для уровня воды ===
     if (init_water_level_sensor() != ESP_OK) return;
 
-    // === Инициализация SHT30 ===
+    // === Инициализация насоса ===
+    if (init_water_pump() != ESP_OK) return;
     if (sht30_init(&sht30_dev, SHT30_I2C_PORT, SHT30_SDA_PIN, SHT30_SCL_PIN, SHT30_ADDR_DEFAULT) != ESP_OK) {
         ESP_LOGE(MAIN_TAG, "Failed to initialize SHT30");
         return;
@@ -714,6 +965,14 @@ void app_main() {
     mqttd_add_tx_topic_ex(CONFIG_TOPIC_WATER_LEVEL, TYPE_INT);      // Уровень воды
     mqttd_add_tx_topic_ex(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR);     // Состояние полива
     mqttd_add_rx_topic(CONFIG_TOPIC_IRRIG_CONTROL, mqtt_receive_callback);  // Команды
+
+    // === Регистрация MQTT топиков для конфигурации ===
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_VENT_OPEN_TEMP, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_VENT_CLOSE_TEMP, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION, mqtt_receive_callback);
 
     wifiStart();
      // === Запуск задачи полива ===

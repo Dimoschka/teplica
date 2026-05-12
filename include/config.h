@@ -10,7 +10,11 @@
 extern "C" {
 #endif
 
-
+#if defined(__has_include)
+#  if __has_include("config_local.h")
+#    include "config_local.h"
+#  endif
+#endif
 
 
 // ========================================
@@ -19,9 +23,13 @@ extern "C" {
 
 // Основная сеть
 
+#ifndef WIFI_SSID
+#define WIFI_SSID ""
+#endif
 
-#define WIFI_SSID           "trqrt"             // Замените на реальный SSID при запуске
-#define WIFI_PASS           "rtewert"              // Замените на реальный пароль при запуске
+#ifndef WIFI_PASS
+#define WIFI_PASS ""
+#endif
 
 // Максимальное количество попыток подключения
 #define WIFI_MAX_RETRIES    5
@@ -48,12 +56,21 @@ extern "C" {
 
 // Брокер
 
+#ifndef CONFIG_MQTT_BROKER
+#define CONFIG_MQTT_BROKER ""
+#endif
 
+#ifndef CONFIG_MQTT_PORT
+#define CONFIG_MQTT_PORT 1883
+#endif
 
-#define CONFIG_MQTT_BROKER       "192.168.100.100" // Замените на реальный IP при запуске
-#define CONFIG_MQTT_PORT         1883
-#define CONFIG_MQTT_USER         "asdfa"    // Замените на реального пользователя при запуске
-#define CONFIG_MQTT_PASS         "asdf"        // Замените на реальный пароль при запуске
+#ifndef CONFIG_MQTT_USER
+#define CONFIG_MQTT_USER ""
+#endif
+
+#ifndef CONFIG_MQTT_PASS
+#define CONFIG_MQTT_PASS ""
+#endif
 
 #define CONFIG_MQTT_CLIENT_ID   "greenhouse_controller"
 
@@ -66,6 +83,30 @@ extern "C" {
 #define CONFIG_TOPIC_WATER_LEVEL     "greenhouse/sensors/water_level"
 #define CONFIG_TOPIC_IRRIG_STATE     "greenhouse/status/irrigation"
 #define CONFIG_TOPIC_IRRIG_CONTROL   "greenhouse/control/irrigation"
+
+
+// ========================================
+// === MQTT Топики для конфигурации =======
+// ========================================
+
+#define CONFIG_TOPIC_CONFIG_VENT_OPEN_TEMP       "greenhouse/config/vent_open_temp"
+#define CONFIG_TOPIC_CONFIG_VENT_CLOSE_TEMP      "greenhouse/config/vent_close_temp"
+#define CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR      "greenhouse/config/irrigation_hour"
+#define CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR "greenhouse/config/fill_tank_start_hour"
+#define CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR   "greenhouse/config/fill_tank_end_hour"
+#define CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION  "greenhouse/config/irrigation_duration"
+
+
+// ========================================
+// === Дефолтные значения настроек ========
+// ========================================
+
+#define DEFAULT_VENT_OPEN_TEMP      28.0f
+#define DEFAULT_VENT_CLOSE_TEMP     25.0f
+#define DEFAULT_IRRIGATION_HOUR     19
+#define DEFAULT_FILL_TANK_START_HOUR 10
+#define DEFAULT_FILL_TANK_END_HOUR  16
+#define DEFAULT_IRRIGATION_DURATION_S 300
 
 
 // ========================================
@@ -134,8 +175,10 @@ extern "C" {
 #define PUMP_PWM_RES_BITS     8
 #define PUMP_MAX_DUTY         ((1 << PUMP_PWM_RES_BITS) - 1)
 
-#define WATER_LEVEL_EMPTY_MV  0  // Значение при пустом баке (настройка под датчик!)
-#define WATER_LEVEL_FULL_MV   3000  // При полном баке
+#define WATER_LEVEL_EMPTY_MV  340  // Значение при пустом баке (настройка под датчик!)
+#define WATER_LEVEL_FULL_MV   3080  // При полном баке
+#define WATER_LEVEL_EMPTY_MARGIN_MV  50  // Градиент погрешности для пустого бака
+#define WATER_LEVEL_FULL_MARGIN_MV   50  // Градиент погрешности для полного бака
 
 #define IRRIGATION_HOUR       19    // Полив в 19:00
 #define FILL_TANK_START_HOUR  10    // Начало заправки бака

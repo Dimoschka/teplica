@@ -155,7 +155,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                 // esp_mqtt_client_publish(client, tx_topics[i].topic, "online", 0, 1, 1);
             }
             for (int i = 0; i < rx_topics_count; ++i) {
-                // esp_mqtt_client_subscribe(client, rx_topics[i].topic, 0);
+                esp_mqtt_client_subscribe(mqtt_client, rx_topics[i].topic, 0);
             }
             break;
         case MQTT_EVENT_DISCONNECTED:
@@ -187,7 +187,7 @@ bool mqttd_start(void)
     mqttCfg.credentials.client_id = current_cfg.client_id;
     mqttCfg.network.disable_auto_reconnect = false;
     mqttCfg.session.protocol_ver = MQTT_PROTOCOL_V_3_1_1;
-    mqttCfg.session.keepalive = 60;
+    mqttCfg.session.keepalive = 120;
 
     // Если есть хотя бы один исходящий топик, используем его для last_will
     if (tx_topics_count > 0) {
