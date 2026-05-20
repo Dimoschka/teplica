@@ -95,6 +95,7 @@ extern "C" {
 #define CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR "greenhouse/config/fill_tank_start_hour"
 #define CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR   "greenhouse/config/fill_tank_end_hour"
 #define CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION  "greenhouse/config/irrigation_duration"
+#define CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED     "greenhouse/config/irrigation_speed"  // Скорость насоса полива, значение 1..100
 
 
 // ========================================
@@ -185,7 +186,7 @@ extern "C" {
 #define FILL_TANK_END_HOUR    16    // Окончание заправки
 
 #define IRRIGATION_DURATION_S 300  // 5 минут полива
-
+#define DEFAULT_IRRIGATION_PUMP_SPEED 80 // % мощности насоса во время полива
 
 // ========================================
 // === Логгирование =======================

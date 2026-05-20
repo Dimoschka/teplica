@@ -96,6 +96,7 @@ static int g_irrigation_hour = DEFAULT_IRRIGATION_HOUR;
 static int g_fill_tank_start_hour = DEFAULT_FILL_TANK_START_HOUR;
 static int g_fill_tank_end_hour = DEFAULT_FILL_TANK_END_HOUR;
 static int g_irrigation_duration_s = DEFAULT_IRRIGATION_DURATION_S;
+static int g_irrigation_pump_speed = DEFAULT_IRRIGATION_PUMP_SPEED;
 
 /* ========================================================================
  * Вспомогательные функции для полива
@@ -178,12 +179,13 @@ static int read_water_level_voltage_mv(void) {
  */
 static int read_water_level_percent(void) {
     int voltage_mv = read_water_level_voltage_mv();
+    // ESP_LOGI(MAIN_TAG, "Напряжение датчика уровня воды: %d мВ", voltage_mv);
     if (voltage_mv < 0) {
         return -1;  // Ошибка чтения
     }
 
-    if (voltage_mv == 0) {
-        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (0 мВ)");
+    if (voltage_mv <= 100) {
+        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (>200 мВ)");
         return -1;  // Отключенный датчик
     }
 
@@ -230,9 +232,10 @@ static void close_valve(int gpio) {
 /**
  * @brief Включает насос с заданной мощностью
  */
-static void start_pump(uint32_t duty) {
+static void start_pump(int duty_percent) {
+    int duty = CLAMP(duty_percent, 0, 100);
     pwm_load_set_duty(g_pump_pwm, duty);
-    ESP_LOGI("IRRIG", "Насос включён: %d%%", (int)(duty * 100 / PUMP_MAX_DUTY));
+    ESP_LOGI("IRRIG", "Насос включён: %d%%", duty);
 }
 
 /**
@@ -296,6 +299,13 @@ static void load_settings_from_nvs(void) {
     // Загрузка длительности (секунды)
     if (nvs_get_i32(nvs_handle, "irrigation_dur", &temp) == ESP_OK) {
         g_irrigation_duration_s = temp;
+    }
+    if (nvs_get_i32(nvs_handle, "irrigation_speed", &temp) == ESP_OK) {
+        if (temp >= 1 && temp <= 100) {
+            g_irrigation_pump_speed = temp;
+        } else {
+            ESP_LOGW(MAIN_TAG, "Некорректная сохранённая скорость насоса: %d", temp);
+        }
     }
 
     nvs_close(nvs_handle);
@@ -409,7 +419,7 @@ static void irrigation_task(void *arg) {
                 open_valve(VALVE_GARDEN1_GPIO);
                 open_valve(VALVE_GARDEN2_GPIO);
                 open_valve(VALVE_GARDEN3_GPIO);
-                start_pump(PUMP_MAX_DUTY * 0.8);  // 80%
+                start_pump(g_irrigation_pump_speed);
 
                 // Мониторинг полива с проверкой датчика каждые 30 секунд
                 bool irrigation_aborted = false;
@@ -702,7 +712,7 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
             open_valve(VALVE_GARDEN1_GPIO);
             open_valve(VALVE_GARDEN2_GPIO);
             open_valve(VALVE_GARDEN3_GPIO);
-            start_pump(PUMP_MAX_DUTY * 0.8);
+            start_pump(g_irrigation_pump_speed);
 
             // Мониторинг ручного полива
             bool irrigation_aborted = false;
@@ -818,6 +828,20 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
                 ESP_LOGI(MAIN_TAG, "Длительность полива установлена: %d сек", new_duration);
             } else {
                 ESP_LOGW(MAIN_TAG, "Некорректная длительность полива: %d сек", new_duration);
+            }
+        }
+        cJSON_Delete(json);
+    }
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED) == 0) {
+        cJSON *json = cJSON_Parse(value);
+        if (json && cJSON_IsNumber(json)) {
+            int new_speed = (int)cJSON_GetNumberValue(json);
+            if (new_speed >= 1 && new_speed <= 100) {
+                g_irrigation_pump_speed = new_speed;
+                save_setting_to_nvs("irrigation_speed", new_speed);
+                ESP_LOGI(MAIN_TAG, "Скорость насоса полива установлена: %d%%", new_speed);
+            } else {
+                ESP_LOGW(MAIN_TAG, "Некорректная скорость насоса полива: %d", new_speed);
             }
         }
         cJSON_Delete(json);
@@ -973,6 +997,7 @@ void app_main() {
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR, mqtt_receive_callback);
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR, mqtt_receive_callback);
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED, mqtt_receive_callback);
 
     wifiStart();
      // === Запуск задачи полива ===
