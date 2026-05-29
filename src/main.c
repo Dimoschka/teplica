@@ -23,7 +23,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <time.h>
+#include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <limits.h>
 #include "cJSON.h"
 
 
@@ -45,6 +48,16 @@ typedef enum {
 } vent_state_t;
 
 /**
+ * @brief Состояние наполнения бака
+ */
+typedef enum {
+    TANK_FILL_IDLE,          // Ожидание команды
+    TANK_FILL_IN_PROGRESS,   // Процесс наполнения
+    TANK_FILL_COMPLETE,      // Завершено успешно
+    TANK_FILL_ERROR          // Ошибка (датчик отключен)
+} tank_fill_state_t;
+
+/**
  * @brief Сообщение для задачи управления климатом
  */
 typedef struct {
@@ -61,7 +74,9 @@ typedef struct {
  // Данные датчиков
 
 static bool g_tank_filled = false;  // Флаг: бак заполнен сегодня
-static bool g_irrigation_done = false;  // Полив выполнен сегодня
+static int g_previous_water_level_percent = -1;  // Последний валидный уровень воды
+static tank_fill_state_t g_tank_fill_state = TANK_FILL_IDLE;  // Состояние наполнения
+static bool g_tank_fill_manual_requested = false;  // Запрос ручного наполнения
 
 
 // Данные датчиков
@@ -92,11 +107,20 @@ static bool g_vent_position = false;  // false = закрыто, true = откр
 // Настраиваемые параметры (сохранение в NVS)
 static float g_vent_open_temp = DEFAULT_VENT_OPEN_TEMP;
 static float g_vent_close_temp = DEFAULT_VENT_CLOSE_TEMP;
-static int g_irrigation_hour = DEFAULT_IRRIGATION_HOUR;
 static int g_fill_tank_start_hour = DEFAULT_FILL_TANK_START_HOUR;
 static int g_fill_tank_end_hour = DEFAULT_FILL_TANK_END_HOUR;
 static int g_irrigation_duration_s = DEFAULT_IRRIGATION_DURATION_S;
 static int g_irrigation_pump_speed = DEFAULT_IRRIGATION_PUMP_SPEED;
+static int g_garden_irrigation_pct[GARDEN_BEDS_COUNT] = {DEFAULT_GARDEN_IRRIGATION_PCT, DEFAULT_GARDEN_IRRIGATION_PCT, DEFAULT_GARDEN_IRRIGATION_PCT};
+static int g_garden_irrigation_freq[GARDEN_BEDS_COUNT] = {DEFAULT_GARDEN_IRRIGATION_FREQ, DEFAULT_GARDEN_IRRIGATION_FREQ, DEFAULT_GARDEN_IRRIGATION_FREQ};
+static int g_garden_irrigation_done_today[GARDEN_BEDS_COUNT] = {0, 0, 0};
+static bool g_irrigation_happened_today = false;
+static time_t g_last_irrigation_time = 0;
+
+static void register_irrigation_event(void) {
+    time(&g_last_irrigation_time);
+    g_irrigation_happened_today = true;
+}
 
 /* ========================================================================
  * Вспомогательные функции для полива
@@ -174,43 +198,95 @@ static int read_water_level_voltage_mv(void) {
 }
 
 /**
- * @brief Считывает уровень воды в процентах (0–100%)
- * @return Уровень в процентах, -1 при отключенном датчике или ошибке
+ * @brief Определяет шаг уровня воды (0-9, где 0=пусто, 9=полно)
+ * @return Шаг (0-9), -1 при отключенном датчике или ошибке
+ */
+static int read_water_level_step(void) {
+    int voltage_mv = read_water_level_voltage_mv();
+    
+    if (voltage_mv < 0) {
+        return -1;  // Ошибка чтения ADC
+    }
+
+    if (voltage_mv <= WATER_LEVEL_SENSOR_DISCONNECTED_MV) {
+        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (напряжение %d мВ < %d мВ)",
+                 voltage_mv, WATER_LEVEL_SENSOR_DISCONNECTED_MV);
+        return -1;  // Датчик отключен
+    }
+
+    // Проверка мертвой зоны (магнит между герконами)
+    if (voltage_mv == WATER_LEVEL_DEADZONE_MV) {
+        ESP_LOGD(MAIN_TAG, "Датчик в мертвой зоне (810 мВ), используем предыдущее значение");
+        if (g_previous_water_level_percent >= 0) {
+            return g_previous_water_level_percent / 10;  // Вернуть предыдущий шаг
+        }
+        // Если предыдущего значения нет, считаем это полным баком
+        g_previous_water_level_percent = 100;
+        return 10;
+    }
+
+    // Массив напряжений для каждого шага
+    static const int step_voltages[WATER_LEVEL_STEPS] = {
+        WATER_LEVEL_STEP_0_MV,
+        WATER_LEVEL_STEP_1_MV,
+        WATER_LEVEL_STEP_2_MV,
+        WATER_LEVEL_STEP_3_MV,
+        WATER_LEVEL_STEP_4_MV,
+        WATER_LEVEL_STEP_5_MV,
+        WATER_LEVEL_STEP_6_MV,
+        WATER_LEVEL_STEP_7_MV,
+        WATER_LEVEL_STEP_8_MV,
+        WATER_LEVEL_STEP_9_MV
+    };
+
+    // Определяем ближайший шаг с учетом допуска
+    int best_step = -1;
+    int best_diff = INT_MAX;
+
+    for (int step = 0; step < WATER_LEVEL_STEPS; step++) {
+        int diff = abs(voltage_mv - step_voltages[step]);
+        
+        // Если напряжение в пределах допуска - немедленно определяем шаг
+        if (diff <= WATER_LEVEL_STEP_TOLERANCE_MV) {
+            best_step = step;
+            best_diff = diff;
+            break;  // Нашли точное совпадение, больше не ищем
+        }
+
+        // Иначе находим ближайший шаг
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_step = step;
+        }
+    }
+
+    if (best_step >= 0) {
+        ESP_LOGD(MAIN_TAG, "Напряжение: %d мВ → Шаг %d (%d%%)", 
+                 voltage_mv, best_step, best_step * 10);
+        g_previous_water_level_percent = best_step * 10;
+        return best_step;
+    }
+
+    // Если напряжение вне диапазона, логируем ошибку
+    ESP_LOGW(MAIN_TAG, "Неожиданное напряжение датчика: %d мВ", voltage_mv);
+    return -1;
+}
+
+/**
+ * @brief Считывает уровень воды в процентах (0–100%, кратно 10%)
+ * @return Уровень в процентах (0, 10, 20... 100), -1 при отключенном датчике или ошибке
  */
 static int read_water_level_percent(void) {
-    int voltage_mv = read_water_level_voltage_mv();
-    // ESP_LOGI(MAIN_TAG, "Напряжение датчика уровня воды: %d мВ", voltage_mv);
-    if (voltage_mv < 0) {
+    int step = read_water_level_step();
+    
+    if (step < 0) {
         return -1;  // Ошибка чтения
     }
 
-    if (voltage_mv <= 100) {
-        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (>200 мВ)");
-        return -1;  // Отключенный датчик
-    }
-
-    // Градиент погрешности: если напряжение в зоне пустого бака с погрешностью, считаем пустым
-    if (voltage_mv <= WATER_LEVEL_EMPTY_MV + WATER_LEVEL_EMPTY_MARGIN_MV) {
-        return 0;
-    }
-
-    // Если напряжение в зоне полного бака с погрешностью, считаем полным
-    if (voltage_mv >= WATER_LEVEL_FULL_MV - WATER_LEVEL_FULL_MARGIN_MV) {
-        return 100;
-    }
-
-    // Линейная интерполяция между зонами с погрешностью
-    int empty_with_margin = WATER_LEVEL_EMPTY_MV + WATER_LEVEL_EMPTY_MARGIN_MV;
-    int full_with_margin = WATER_LEVEL_FULL_MV - WATER_LEVEL_FULL_MARGIN_MV;
-    int range_mv = full_with_margin - empty_with_margin;
-
-    if (range_mv <= 0) {
-        ESP_LOGE(MAIN_TAG, "Некорректные настройки датчика уровня воды");
-        return -1;
-    }
-
-    int percent = ((voltage_mv - empty_with_margin) * 100) / range_mv;
-    return CLAMP(percent, 0, 100);
+    // Преобразуем шаг в проценты (0-9 → 0-90% + 100% для шага 9)
+    int percent = (step < WATER_LEVEL_STEPS - 1) ? (step * 10) : 100;
+    
+    return percent;
 }
 
 /**
@@ -227,6 +303,128 @@ static void open_valve(int gpio) {
 static void close_valve(int gpio) {
     gpio_set_level(gpio, 0);
     ESP_LOGI("IRRIG", "Клапан на GPIO%d закрыт", gpio);
+}
+
+
+static int get_garden_irrigation_slot_hour(int slot_index, int freq) {
+    if (freq <= 0) {
+        return -1;
+    }
+    int start_hour = GARDEN_IRRIGATION_SCHEDULE_START_HOUR;
+    int end_hour = GARDEN_IRRIGATION_SCHEDULE_END_HOUR;
+    int interval = (end_hour - start_hour) / freq;
+    return start_hour + slot_index * interval;
+}
+
+static bool is_garden_irrigation_time(int bed_index, int hour) {
+    int freq = g_garden_irrigation_freq[bed_index];
+    if (freq <= 0) {
+        return false;
+    }
+
+    for (int slot = 0; slot < freq; ++slot) {
+        int slot_hour = get_garden_irrigation_slot_hour(slot, freq);
+        if (hour == slot_hour && g_garden_irrigation_done_today[bed_index] <= slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int get_garden_valve_gpio(int bed_index) {
+    switch (bed_index) {
+        case 0: return VALVE_GARDEN1_GPIO;
+        case 1: return VALVE_GARDEN2_GPIO;
+        case 2: return VALVE_GARDEN3_GPIO;
+        default: return VALVE_GARDEN1_GPIO;
+    }
+}
+
+static void start_pump(int duty_percent);
+static void stop_pump(void);
+
+static void water_garden_bed_manual(int bed_index) {
+    int valve_gpio = get_garden_valve_gpio(bed_index);
+    ESP_LOGI("IRRIG", "Грядка %d: ручной полив 10 минут", bed_index + 1);
+    open_valve(valve_gpio);
+    start_pump(g_irrigation_pump_speed);
+
+    for (int elapsed = 0; elapsed < GARDEN_IRRIGATION_MANUAL_DURATION_S; ++elapsed) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if ((elapsed + 1) % 60 == 0) {
+            ESP_LOGD("IRRIG", "Грядка %d: ручной полив, прошло %d мин", bed_index + 1, (elapsed + 1) / 60);
+        }
+    }
+
+    stop_pump();
+    close_valve(valve_gpio);
+    ESP_LOGI("IRRIG", "Грядка %d: завершён ручной полив (10 минут)", bed_index + 1);
+}
+
+static void water_garden_bed(int bed_index) {
+    int valve_gpio = get_garden_valve_gpio(bed_index);
+    int desired_pct = g_garden_irrigation_pct[bed_index];
+    int start_level = read_water_level_percent();
+    bool sensor_ok = (start_level >= 0);
+    int target_level = 0;
+    bool fallback_mode = false;
+
+    if (sensor_ok) {
+        target_level = start_level - desired_pct;
+        if (target_level < 0) {
+            target_level = 0;
+        }
+        ESP_LOGI("IRRIG", "Грядка %d: начало полива, уровень %d%%, цель %d%%", bed_index + 1, start_level, target_level);
+    } else {
+        fallback_mode = true;
+        ESP_LOGW("IRRIG", "Грядка %d: датчик уровня не работает, полив по времени %d сек", bed_index + 1, GARDEN_IRRIGATION_FALLBACK_DURATION_S);
+    }
+
+    open_valve(valve_gpio);
+    start_pump(g_irrigation_pump_speed);
+
+    int elapsed = 0;
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        elapsed += 5;
+
+        if (!sensor_ok) {
+            if (elapsed >= GARDEN_IRRIGATION_FALLBACK_DURATION_S) {
+                break;
+            }
+            continue;
+        }
+
+        int current_level = read_water_level_percent();
+        if (current_level < 0) {
+            ESP_LOGW("IRRIG", "Грядка %d: датчик уровня потерян во время полива, продолжаем до %d сек", bed_index + 1, GARDEN_IRRIGATION_FALLBACK_DURATION_S);
+            sensor_ok = false;
+            fallback_mode = true;
+            if (elapsed >= GARDEN_IRRIGATION_FALLBACK_DURATION_S) {
+                break;
+            }
+            continue;
+        }
+
+        if (current_level <= target_level) {
+            ESP_LOGI("IRRIG", "Грядка %d: достигнут целевой уровень %d%%", bed_index + 1, current_level);
+            break;
+        }
+
+        if (elapsed >= GARDEN_IRRIGATION_MAX_DURATION_S) {
+            ESP_LOGW("IRRIG", "Грядка %d: превышено максимальное время полива", bed_index + 1);
+            break;
+        }
+    }
+
+    stop_pump();
+    close_valve(valve_gpio);
+
+    if (fallback_mode) {
+        ESP_LOGI("IRRIG", "Грядка %d: завершён полив по времени (%d сек)", bed_index + 1, elapsed);
+    } else {
+        ESP_LOGI("IRRIG", "Грядка %d: завершён полив", bed_index + 1);
+    }
 }
 
 /**
@@ -251,7 +449,9 @@ static void stop_pump(void) {
  */
 static void start_tank_fill(void) {
     gpio_set_level(TANK_FILL_GPIO, 1);
+    g_tank_fill_state = TANK_FILL_IN_PROGRESS;
     ESP_LOGI("IRRIG", "Запуск наполнения бака");
+    mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "filling");
 }
 
 /**
@@ -260,6 +460,21 @@ static void start_tank_fill(void) {
 static void stop_tank_fill(void) {
     gpio_set_level(TANK_FILL_GPIO, 0);
     ESP_LOGI("IRRIG", "Наполнение бака остановлено");
+}
+
+/**
+ * @brief Проверяет, достиг ли бак максимума при наполнении (3080 мВ)
+ * @return true если бак полный (напряжение >= 3080 мВ с допуском)
+ */
+static bool is_tank_fill_complete(void) {
+    int voltage_mv = read_water_level_voltage_mv();
+    
+    if (voltage_mv < 0) {
+        return false;  // Ошибка чтения
+    }
+    
+    // Проверяем достижение максимума при наполнении (3080 мВ ±50 мВ)
+    return (voltage_mv >= (WATER_LEVEL_FILL_MAX_MV - WATER_LEVEL_STEP_TOLERANCE_MV));
 }
 /* ========================================================================
  * Вспомогательные функции
@@ -285,17 +500,6 @@ static void load_settings_from_nvs(void) {
         g_vent_close_temp = temp / 100.0f;
     }
 
-    // Загрузка времени (часы)
-    if (nvs_get_i32(nvs_handle, "irrigation_hour", &temp) == ESP_OK) {
-        g_irrigation_hour = temp;
-    }
-    if (nvs_get_i32(nvs_handle, "fill_start_hour", &temp) == ESP_OK) {
-        g_fill_tank_start_hour = temp;
-    }
-    if (nvs_get_i32(nvs_handle, "fill_end_hour", &temp) == ESP_OK) {
-        g_fill_tank_end_hour = temp;
-    }
-
     // Загрузка длительности (секунды)
     if (nvs_get_i32(nvs_handle, "irrigation_dur", &temp) == ESP_OK) {
         g_irrigation_duration_s = temp;
@@ -305,6 +509,19 @@ static void load_settings_from_nvs(void) {
             g_irrigation_pump_speed = temp;
         } else {
             ESP_LOGW(MAIN_TAG, "Некорректная сохранённая скорость насоса: %d", temp);
+        }
+    }
+
+    for (int i = 0; i < GARDEN_BEDS_COUNT; ++i) {
+        char key[32];
+        snprintf(key, sizeof(key), "garden%d_irrigation_pct", i + 1);
+        if (nvs_get_i32(nvs_handle, key, &temp) == ESP_OK && temp >= 1 && temp <= 100) {
+            g_garden_irrigation_pct[i] = temp;
+        }
+
+        snprintf(key, sizeof(key), "garden%d_irrigation_freq", i + 1);
+        if (nvs_get_i32(nvs_handle, key, &temp) == ESP_OK && temp >= 1 && temp <= 4) {
+            g_garden_irrigation_freq[i] = temp;
         }
     }
 
@@ -371,9 +588,67 @@ static void irrigation_task(void *arg) {
 
         // Сброс флагов в начале дня
         if (day_changed && hour == 0) {
-            g_irrigation_done = false;
             g_tank_filled = false;
+            g_irrigation_happened_today = false;
+            g_last_irrigation_time = 0;
+            for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
+                g_garden_irrigation_done_today[bed] = 0;
+            }
             ESP_LOGI("IRRIG", "Сброс флагов полива на новый день");
+        }
+
+        // 🔹 Обработка ручного запроса наполнения бака
+        if (g_tank_fill_manual_requested && g_tank_fill_state != TANK_FILL_IN_PROGRESS) {
+            ESP_LOGI("IRRIG", "Запуск ручного наполнения бака");
+            start_tank_fill();
+
+            // Мониторинг ручного наполнения
+            bool fill_complete = false;
+            bool sensor_error = false;
+            
+            for (int i = 0; i < 600; i++) {  // Максимум 10 минут
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                
+                // Проверяем флаг отмены (если пришла команда stop)
+                if (!g_tank_fill_manual_requested) {
+                    ESP_LOGI("IRRIG", "Ручное наполнение остановлено пользователем");
+                    stop_tank_fill();
+                    g_tank_fill_state = TANK_FILL_IDLE;
+                    mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "idle");
+                    break;
+                }
+                
+                int current_level = read_water_level_percent();
+                if (current_level < 0) {
+                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время ручного наполнения");
+                    sensor_error = true;
+                    g_tank_fill_state = TANK_FILL_ERROR;
+                    mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_sensor");
+                    break;
+                }
+                
+                // Проверяем достижение максимума
+                if (is_tank_fill_complete()) {
+                    ESP_LOGI("IRRIG", "Ручное наполнение завершено: максимальный уровень достигнут");
+                    fill_complete = true;
+                    break;
+                }
+                
+                // Логируем прогресс каждые 10 секунд
+                if (i % 10 == 0) {
+                    ESP_LOGD("IRRIG", "Ручное наполнение: уровень %d%%, прошло %d сек", current_level, i);
+                }
+            }
+
+            if (fill_complete || !sensor_error) {
+                stop_tank_fill();
+                g_tank_fill_state = TANK_FILL_COMPLETE;
+                mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
+                ESP_LOGI("IRRIG", "Ручное наполнение завершено");
+            }
+            
+            g_tank_fill_manual_requested = false;
+            g_tank_fill_state = TANK_FILL_IDLE;
         }
 
         // 🔹 Наполнение бака днём (если ещё не заполняли и уровень низкий)
@@ -384,67 +659,66 @@ static void irrigation_task(void *arg) {
             ESP_LOGI("IRRIG", "Запуск наполнения бака (уровень %d%%)", level);
             start_tank_fill();
 
-            // Мониторинг наполнения с проверкой датчика
-            bool fill_aborted = false;
-            for (int i = 0; i < 30; i++) {  // 30 секунд
+            // Мониторинг наполнения с контролем напряжения датчика
+            bool fill_complete = false;
+            bool sensor_error = false;
+            
+            for (int i = 0; i < 600; i++) {  // Максимум 10 минут (600 сек)
                 vTaskDelay(pdMS_TO_TICKS(1000));
+                
                 int current_level = read_water_level_percent();
                 if (current_level < 0) {
-                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время наполнения бака, прерываем");
-                    fill_aborted = true;
+                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время наполнения бака");
+                    sensor_error = true;
+                    g_tank_fill_state = TANK_FILL_ERROR;
+                    mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_sensor");
                     break;
+                }
+                
+                // Проверяем достижение максимума при наполнении (3080 мВ)
+                if (is_tank_fill_complete()) {
+                    ESP_LOGI("IRRIG", "Бак заполнен до максимума (3080 мВ), текущий уровень %d%%", current_level);
+                    fill_complete = true;
+                    break;
+                }
+                
+                // Логируем прогресс каждые 10 секунд
+                if (i % 10 == 0) {
+                    ESP_LOGD("IRRIG", "Наполнение в процессе: уровень %d%%, прошло %d сек", current_level, i);
                 }
             }
 
             stop_tank_fill();
-            if (!fill_aborted) {
+            if (fill_complete && !sensor_error) {
                 g_tank_filled = true;
-                ESP_LOGI("IRRIG", "Бак наполнен");
+                g_tank_fill_state = TANK_FILL_COMPLETE;
+                mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
+                ESP_LOGI("IRRIG", "Бак наполнен успешно");
+            } else if (sensor_error) {
+                ESP_LOGW("IRRIG", "Наполнение бака прервано: датчик отключен");
+            } else {
+                g_tank_filled = true;
+                g_tank_fill_state = TANK_FILL_COMPLETE;
+                mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
+                ESP_LOGI("IRRIG", "Бак наполнен (таймаут или неполный)");
             }
+            g_tank_fill_state = TANK_FILL_IDLE;
         } else if (level < 0) {
             ESP_LOGW("IRRIG", "Невозможно проверить уровень воды: датчик отключен");
         }
 
-        // 🔹 Автоматический полив вечером
-        if (!g_irrigation_done &&
-            hour == g_irrigation_hour && timeinfo.tm_min == 0 && timeinfo.tm_sec < 5) {
-            int level = read_water_level_percent();
-            if (level < 0) {
-                ESP_LOGW("IRRIG", "❗ Датчик уровня воды отключен, полив пропущен");
-            } else if (level < 30) {
-                ESP_LOGW("IRRIG", "❗ Уровень воды низкий (%d%%), полив пропущен", level);
-            } else {
-                ESP_LOGI("IRRIG", "🌿 Запуск автоматического полива (уровень %d%%)", level);
-
-                open_valve(VALVE_GARDEN1_GPIO);
-                open_valve(VALVE_GARDEN2_GPIO);
-                open_valve(VALVE_GARDEN3_GPIO);
-                start_pump(g_irrigation_pump_speed);
-
-                // Мониторинг полива с проверкой датчика каждые 30 секунд
-                bool irrigation_aborted = false;
-                int duration_remaining = g_irrigation_duration_s;
-                while (duration_remaining > 0) {
-                    int check_interval = (duration_remaining > 30) ? 30 : duration_remaining;
-                    vTaskDelay(pdMS_TO_TICKS(check_interval * 1000));
-                    duration_remaining -= check_interval;
-
-                    int current_level = read_water_level_percent();
-                    if (current_level < 0) {
-                        ESP_LOGW("IRRIG", "Датчик уровня отключен во время полива, прерываем");
-                        irrigation_aborted = true;
-                        break;
-                    }
+        // 🔹 Автоматический полив грядок по проценту от бака
+        if (timeinfo.tm_min == 0 && timeinfo.tm_sec < 10) {
+            for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
+                if (g_garden_irrigation_done_today[bed] >= g_garden_irrigation_freq[bed]) {
+                    continue;
                 }
 
-                stop_pump();
-                close_valve(VALVE_GARDEN1_GPIO);
-                close_valve(VALVE_GARDEN2_GPIO);
-                close_valve(VALVE_GARDEN3_GPIO);
-
-                if (!irrigation_aborted) {
-                    g_irrigation_done = true;
-                    ESP_LOGI("IRRIG", "✅ Полив завершён");
+                if (is_garden_irrigation_time(bed, hour)) {
+                    ESP_LOGI("IRRIG", "🌿 Запуск полива грядки %d: %d%% от бака (%d раз/сутки)", bed + 1, g_garden_irrigation_pct[bed], g_garden_irrigation_freq[bed]);
+                    water_garden_bed(bed);
+                    g_garden_irrigation_done_today[bed]++;
+                    register_irrigation_event();
                 }
             }
         }
@@ -593,6 +867,28 @@ static void mqtt_publish_task(void *pvParameters) {
                 water_level = -1;
             }
             mqttd_publish_type(CONFIG_TOPIC_WATER_LEVEL, TYPE_INT, &water_level);
+
+            const char *today_state = g_irrigation_happened_today ? "1" : "0";
+            mqttd_publish_type(CONFIG_TOPIC_IRRIG_TODAY, TYPE_CHAR, today_state);
+
+            char last_time_str[16] = "none";
+            if (g_last_irrigation_time > 0) {
+                struct tm timeinfo;
+                localtime_r(&g_last_irrigation_time, &timeinfo);
+                strftime(last_time_str, sizeof(last_time_str), "%H:%M", &timeinfo);
+            }
+            mqttd_publish_type(CONFIG_TOPIC_IRRIG_LAST_TIME, TYPE_CHAR, last_time_str);
+            
+            // Публикация статуса наполнения бака
+            const char *tank_status = "idle";
+            if (g_tank_fill_state == TANK_FILL_IN_PROGRESS) {
+                tank_status = "filling";
+            } else if (g_tank_fill_state == TANK_FILL_COMPLETE) {
+                tank_status = "complete";
+            } else if (g_tank_fill_state == TANK_FILL_ERROR) {
+                tank_status = "error";
+            }
+            mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, tank_status);
         }
         vTaskDelay(pdMS_TO_TICKS(10000)); // каждые 10 секунд
     }
@@ -687,6 +983,40 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
 
     ESP_LOGI(MAIN_TAG, "📩 Получено: %s = %s", topic, value);
 
+    // === Управление наполнением бака ===
+    if (strcmp(topic, CONFIG_TOPIC_TANK_FILL_CONTROL) == 0) {
+        if (strcmp(value, "fill_tank") == 0) {
+            ESP_LOGI("IRRIG", "Ручная команда: наполнить бак");
+            
+            // Проверяем текущее состояние
+            if (g_tank_fill_state == TANK_FILL_IN_PROGRESS) {
+                ESP_LOGW("IRRIG", "Наполнение бака уже в процессе, команда проигнорирована");
+                mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_already_running");
+                return;
+            }
+            
+            int level = read_water_level_percent();
+            if (level < 0) {
+                ESP_LOGE("IRRIG", "❌ Наполнение невозможно: датчик уровня воды отключен");
+                g_tank_fill_state = TANK_FILL_ERROR;
+                mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_sensor");
+                return;
+            }
+            
+            g_tank_fill_manual_requested = true;
+            mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "filling");
+        }
+        else if (strcmp(value, "stop_fill") == 0) {
+            ESP_LOGI("IRRIG", "Ручная команда: остановить наполнение бака");
+            g_tank_fill_manual_requested = false;
+            stop_tank_fill();
+            g_tank_fill_state = TANK_FILL_IDLE;
+            mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "idle");
+        }
+        return;
+    }
+
+    // === Остальные команды ===
     climate_data_t cmd = { .humidity = 50, .force_update = true };
 
     if (strcmp(value, "open") == 0) {
@@ -701,50 +1031,64 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
     }
 
       // === Управление поливом ===
-    else if (strcmp(value, "irrigate") == 0) {
-        ESP_LOGI("IRRIG", "Получена команда на ручной полив");
+    else if (strcmp(value, "irrigate") == 0 || value[0] == '{') {
+        ESP_LOGI("IRRIG", "Получена команда на ручной полив (per-bed)");
 
-        int level = read_water_level_percent();
-        if (level < 0) {
-            ESP_LOGE("IRRIG", "❌ Полив невозможен: датчик уровня воды отключен");
-            mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_sensor_disconnected");
+        cJSON *json = NULL;
+        int selected[GARDEN_BEDS_COUNT];
+        for (int i = 0; i < GARDEN_BEDS_COUNT; i++) selected[i] = 0;
+        bool select_any = false;
+
+        if (value[0] == '{') {
+            json = cJSON_Parse(value);
+            if (json) {
+                cJSON *beds = cJSON_GetObjectItem(json, "beds");
+                if (beds) {
+                    if (cJSON_IsString(beds) && strcmp(beds->valuestring, "all") == 0) {
+                        for (int i = 0; i < GARDEN_BEDS_COUNT; i++) { selected[i] = 1; select_any = true; }
+                    } else if (cJSON_IsNumber(beds)) {
+                        int b = (int)cJSON_GetNumberValue(beds);
+                        if (b >= 1 && b <= GARDEN_BEDS_COUNT) { selected[b - 1] = 1; select_any = true; }
+                    } else if (cJSON_IsArray(beds)) {
+                        cJSON *item = NULL;
+                        cJSON_ArrayForEach(item, beds) {
+                            if (cJSON_IsNumber(item)) {
+                                int b = (int)cJSON_GetNumberValue(item);
+                                if (b >= 1 && b <= GARDEN_BEDS_COUNT) { selected[b - 1] = 1; select_any = true; }
+                            }
+                        }
+                    }
+                }
+            } else {
+                ESP_LOGW("IRRIG", "Не удалось разобрать JSON, выполняю полив всех грядок");
+                for (int i = 0; i < GARDEN_BEDS_COUNT; i++) { selected[i] = 1; select_any = true; }
+            }
         } else {
-            open_valve(VALVE_GARDEN1_GPIO);
-            open_valve(VALVE_GARDEN2_GPIO);
-            open_valve(VALVE_GARDEN3_GPIO);
-            start_pump(g_irrigation_pump_speed);
+            for (int i = 0; i < GARDEN_BEDS_COUNT; i++) { selected[i] = 1; select_any = true; }
+        }
 
-            // Мониторинг ручного полива
-            bool irrigation_aborted = false;
-            for (int i = 0; i < 60; i++) {  // 60 секунд
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                int current_level = read_water_level_percent();
-                if (current_level < 0) {
-                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время ручного полива, прерываем");
-                    irrigation_aborted = true;
-                    break;
+        if (json) cJSON_Delete(json);
+
+        if (!select_any) {
+            ESP_LOGW("IRRIG", "Нет указанных грядок для полива");
+            mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "no_beds_specified");
+        } else {
+            int level = read_water_level_percent();
+            if (level < 0) {
+                ESP_LOGE("IRRIG", "❌ Полив невозможен: датчик уровня воды отключен");
+                mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_sensor_disconnected");
+            } else {
+                for (int bed = 0; bed < GARDEN_BEDS_COUNT; bed++) {
+                    if (!selected[bed]) continue;
+                    ESP_LOGI("IRRIG", "🌿 Ручной полив грядки %d", bed + 1);
+                    water_garden_bed_manual(bed);
+                    /* Пометить грядку как политую сегодня, чтобы автополив не запускался */
+                    g_garden_irrigation_done_today[bed]++;
+                    register_irrigation_event();
+                    mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "done");
                 }
             }
-
-            stop_pump();
-            close_valve(VALVE_GARDEN1_GPIO);
-            close_valve(VALVE_GARDEN2_GPIO);
-            close_valve(VALVE_GARDEN3_GPIO);
-
-            if (!irrigation_aborted) {
-                mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "done");
-                ESP_LOGI("IRRIG", "✅ Ручной полив завершён");
-            } else {
-                mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "error_sensor_disconnected");
-            }
         }
-    }
-    else if (strcmp(value, "fill_tank") == 0) {
-        ESP_LOGI("IRRIG", "Ручная команда: наполнить бак");
-        start_tank_fill();
-        vTaskDelay(pdMS_TO_TICKS(60000)); // 1 минута
-        stop_tank_fill();
-        mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "tank_filled");
     }
 
     // === Конфигурационные команды ===
@@ -776,44 +1120,51 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
         }
         cJSON_Delete(json);
     }
-    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR) == 0) {
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_PCT) == 0 ||
+             strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_PCT) == 0 ||
+             strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_PCT) == 0) {
         cJSON *json = cJSON_Parse(value);
         if (json && cJSON_IsNumber(json)) {
-            int new_hour = (int)cJSON_GetNumberValue(json);
-            if (new_hour >= 0 && new_hour <= 23) {
-                g_irrigation_hour = new_hour;
-                save_setting_to_nvs("irrigation_hour", new_hour);
-                ESP_LOGI(MAIN_TAG, "Час полива установлен: %d", new_hour);
+            int new_pct = (int)cJSON_GetNumberValue(json);
+            if (new_pct >= 1 && new_pct <= 100) {
+                int bed_index = 0;
+                if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_PCT) == 0) {
+                    bed_index = 1;
+                } else if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_PCT) == 0) {
+                    bed_index = 2;
+                }
+                g_garden_irrigation_pct[bed_index] = new_pct;
+                char key[32];
+                snprintf(key, sizeof(key), "garden%d_irrigation_pct", bed_index + 1);
+                save_setting_to_nvs(key, new_pct);
+                ESP_LOGI(MAIN_TAG, "Процент полива грядки %d установлен: %d%%", bed_index + 1, new_pct);
             } else {
-                ESP_LOGW(MAIN_TAG, "Некорректный час полива: %d", new_hour);
+                ESP_LOGW(MAIN_TAG, "Некорректный процент полива: %d", new_pct);
             }
         }
         cJSON_Delete(json);
     }
-    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR) == 0) {
+    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_FREQ) == 0 ||
+             strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_FREQ) == 0 ||
+             strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_FREQ) == 0) {
         cJSON *json = cJSON_Parse(value);
         if (json && cJSON_IsNumber(json)) {
-            int new_hour = (int)cJSON_GetNumberValue(json);
-            if (new_hour >= 0 && new_hour <= 23) {
-                g_fill_tank_start_hour = new_hour;
-                save_setting_to_nvs("fill_start_hour", new_hour);
-                ESP_LOGI(MAIN_TAG, "Час начала наполнения бака установлен: %d", new_hour);
+            int new_freq = (int)cJSON_GetNumberValue(json);
+            if (new_freq >= 1 && new_freq <= 4) {
+                int bed_index = 0;
+                if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_FREQ) == 0) {
+                    bed_index = 1;
+                } else if (strcmp(topic, CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_FREQ) == 0) {
+                    bed_index = 2;
+                }
+                g_garden_irrigation_freq[bed_index] = new_freq;
+                g_garden_irrigation_done_today[bed_index] = 0;
+                char key[32];
+                snprintf(key, sizeof(key), "garden%d_irrigation_freq", bed_index + 1);
+                save_setting_to_nvs(key, new_freq);
+                ESP_LOGI(MAIN_TAG, "Частота полива грядки %d установлена: %d раз/сутки", bed_index + 1, new_freq);
             } else {
-                ESP_LOGW(MAIN_TAG, "Некорректный час начала наполнения: %d", new_hour);
-            }
-        }
-        cJSON_Delete(json);
-    }
-    else if (strcmp(topic, CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR) == 0) {
-        cJSON *json = cJSON_Parse(value);
-        if (json && cJSON_IsNumber(json)) {
-            int new_hour = (int)cJSON_GetNumberValue(json);
-            if (new_hour >= 0 && new_hour <= 23) {
-                g_fill_tank_end_hour = new_hour;
-                save_setting_to_nvs("fill_end_hour", new_hour);
-                ESP_LOGI(MAIN_TAG, "Час окончания наполнения бака установлен: %d", new_hour);
-            } else {
-                ESP_LOGW(MAIN_TAG, "Некорректный час окончания наполнения: %d", new_hour);
+                ESP_LOGW(MAIN_TAG, "Некорректная частота полива: %d", new_freq);
             }
         }
         cJSON_Delete(json);
@@ -988,14 +1339,23 @@ void app_main() {
      // === Регистрация  MQTT топиков  для полива ===
     mqttd_add_tx_topic_ex(CONFIG_TOPIC_WATER_LEVEL, TYPE_INT);      // Уровень воды
     mqttd_add_tx_topic_ex(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR);     // Состояние полива
+    mqttd_add_tx_topic_ex(CONFIG_TOPIC_IRRIG_TODAY, TYPE_CHAR);     // Полив сегодня
+    mqttd_add_tx_topic_ex(CONFIG_TOPIC_IRRIG_LAST_TIME, TYPE_CHAR); // Время последнего полива
     mqttd_add_rx_topic(CONFIG_TOPIC_IRRIG_CONTROL, mqtt_receive_callback);  // Команды
+    
+    // === Регистрация MQTT топиков для наполнения бака ===
+    mqttd_add_tx_topic_ex(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR);    // Статус наполнения
+    mqttd_add_rx_topic(CONFIG_TOPIC_TANK_FILL_CONTROL, mqtt_receive_callback);  // Команды управления
 
     // === Регистрация MQTT топиков для конфигурации ===
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_VENT_OPEN_TEMP, mqtt_receive_callback);
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_VENT_CLOSE_TEMP, mqtt_receive_callback);
-    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR, mqtt_receive_callback);
-    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR, mqtt_receive_callback);
-    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_PCT, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_FREQ, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_PCT, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_FREQ, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_PCT, mqtt_receive_callback);
+    mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_FREQ, mqtt_receive_callback);
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION, mqtt_receive_callback);
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED, mqtt_receive_callback);
 

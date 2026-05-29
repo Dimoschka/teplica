@@ -81,8 +81,12 @@ extern "C" {
 #define CONFIG_TOPIC_VENT_STATE   "greenhouse/vent_state"
 #define CONFIG_TOPIC_VENT_CONTROL "greenhouse/vent_control"
 #define CONFIG_TOPIC_WATER_LEVEL     "greenhouse/sensors/water_level"
-#define CONFIG_TOPIC_IRRIG_STATE     "greenhouse/status/irrigation"
-#define CONFIG_TOPIC_IRRIG_CONTROL   "greenhouse/control/irrigation"
+#define CONFIG_TOPIC_IRRIG_STATE      "greenhouse/status/irrigation"
+#define CONFIG_TOPIC_IRRIG_CONTROL    "greenhouse/control/irrigation"
+#define CONFIG_TOPIC_IRRIG_TODAY      "greenhouse/status/irrigation_today"
+#define CONFIG_TOPIC_IRRIG_LAST_TIME  "greenhouse/status/irrigation_last_time"
+#define CONFIG_TOPIC_TANK_FILL_STATE  "greenhouse/status/tank_fill"
+#define CONFIG_TOPIC_TANK_FILL_CONTROL "greenhouse/control/tank_fill"
 
 
 // ========================================
@@ -91,9 +95,12 @@ extern "C" {
 
 #define CONFIG_TOPIC_CONFIG_VENT_OPEN_TEMP       "greenhouse/config/vent_open_temp"
 #define CONFIG_TOPIC_CONFIG_VENT_CLOSE_TEMP      "greenhouse/config/vent_close_temp"
-#define CONFIG_TOPIC_CONFIG_IRRIGATION_HOUR      "greenhouse/config/irrigation_hour"
-#define CONFIG_TOPIC_CONFIG_FILL_TANK_START_HOUR "greenhouse/config/fill_tank_start_hour"
-#define CONFIG_TOPIC_CONFIG_FILL_TANK_END_HOUR   "greenhouse/config/fill_tank_end_hour"
+#define CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_PCT "greenhouse/config/garden1_irrigation_pct"
+#define CONFIG_TOPIC_CONFIG_GARDEN1_IRRIGATION_FREQ "greenhouse/config/garden1_irrigation_freq"
+#define CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_PCT "greenhouse/config/garden2_irrigation_pct"
+#define CONFIG_TOPIC_CONFIG_GARDEN2_IRRIGATION_FREQ "greenhouse/config/garden2_irrigation_freq"
+#define CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_PCT "greenhouse/config/garden3_irrigation_pct"
+#define CONFIG_TOPIC_CONFIG_GARDEN3_IRRIGATION_FREQ "greenhouse/config/garden3_irrigation_freq" 
 #define CONFIG_TOPIC_CONFIG_IRRIGATION_DURATION  "greenhouse/config/irrigation_duration"
 #define CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED     "greenhouse/config/irrigation_speed"  // Скорость насоса полива, значение 1..100
 
@@ -104,10 +111,17 @@ extern "C" {
 
 #define DEFAULT_VENT_OPEN_TEMP      28.0f
 #define DEFAULT_VENT_CLOSE_TEMP     25.0f
-#define DEFAULT_IRRIGATION_HOUR     19
 #define DEFAULT_FILL_TANK_START_HOUR 10
-#define DEFAULT_FILL_TANK_END_HOUR  16
+#define DEFAULT_FILL_TANK_END_HOUR    16
 #define DEFAULT_IRRIGATION_DURATION_S 300
+#define GARDEN_BEDS_COUNT             3
+#define DEFAULT_GARDEN_IRRIGATION_PCT 20
+#define DEFAULT_GARDEN_IRRIGATION_FREQ 1
+#define GARDEN_IRRIGATION_FALLBACK_DURATION_S 300
+#define GARDEN_IRRIGATION_MANUAL_DURATION_S 600
+#define GARDEN_IRRIGATION_MAX_DURATION_S 900
+#define GARDEN_IRRIGATION_SCHEDULE_START_HOUR 8
+#define GARDEN_IRRIGATION_SCHEDULE_END_HOUR 20
 
 
 // ========================================
@@ -176,17 +190,38 @@ extern "C" {
 #define PUMP_PWM_RES_BITS     8
 #define PUMP_MAX_DUTY         ((1 << PUMP_PWM_RES_BITS) - 1)
 
-#define WATER_LEVEL_EMPTY_MV  340  // Значение при пустом баке (настройка под датчик!)
-#define WATER_LEVEL_FULL_MV   3080  // При полном баке
-#define WATER_LEVEL_EMPTY_MARGIN_MV  50  // Градиент погрешности для пустого бака
-#define WATER_LEVEL_FULL_MARGIN_MV   50  // Градиент погрешности для полного бака
+// ========================================
+// === Датчик уровня воды (10 герконов) ===
+// ========================================
+// 10 дискретных уровней на основе герконовых переключателей
+// Каждый герькон = один шаг (0%, 10%, 20%... 100%)
+
+#define WATER_LEVEL_STEPS 10  // Количество герконов
+
+// Напряжения для каждого шага (в мВ)
+#define WATER_LEVEL_STEP_0_MV    860   // 0%
+#define WATER_LEVEL_STEP_1_MV    930   // 10%
+#define WATER_LEVEL_STEP_2_MV   1010   // 20%
+#define WATER_LEVEL_STEP_3_MV   1100   // 30%
+#define WATER_LEVEL_STEP_4_MV   1210   // 40%
+#define WATER_LEVEL_STEP_5_MV   1350   // 50%
+#define WATER_LEVEL_STEP_6_MV   1520   // 60%
+#define WATER_LEVEL_STEP_7_MV   1740   // 70%
+#define WATER_LEVEL_STEP_8_MV   2030   // 80%
+#define WATER_LEVEL_STEP_9_MV   2450   // 100%
+
+#define WATER_LEVEL_DEADZONE_MV      810   // Мертвая зона датчика (между герконами)
+#define WATER_LEVEL_NORMAL_FULL_MV  2450   // Максимум при нормальном считывании (100%)
+#define WATER_LEVEL_FILL_MAX_MV     3080   // Максимум при наполнении бака (гистерезис)
+#define WATER_LEVEL_STEP_TOLERANCE_MV 50   // Допуск ±5% для определения шага (учет погрешности резисторов)
+#define WATER_LEVEL_SENSOR_DISCONNECTED_MV 100  // Порог отключения датчика
 
 #define IRRIGATION_HOUR       19    // Полив в 19:00
 #define FILL_TANK_START_HOUR  10    // Начало заправки бака
 #define FILL_TANK_END_HOUR    16    // Окончание заправки
 
-#define IRRIGATION_DURATION_S 300  // 5 минут полива
-#define DEFAULT_IRRIGATION_PUMP_SPEED 80 // % мощности насоса во время полива
+#define IRRIGATION_DURATION_S 600  // 10 минут полива
+#define DEFAULT_IRRIGATION_PUMP_SPEED 100 // % мощности насоса во время полива
 
 // ========================================
 // === Логгирование =======================
