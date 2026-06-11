@@ -1,5 +1,5 @@
 
-#define MQTTD_MAX_TOPICS 8   // Максимальное количество топиков
+#include "../include/config.h"
 
 #include <stdbool.h>
 #include <stddef.h>   // size_t
@@ -94,13 +94,22 @@ bool mqttd_add_rx_topic(const char* topic, mqttd_receive_cb_t cb) {
 
 // Добавить входящий топик
 bool mqttd_add_tx_topic(const char* topic) {
-    if (!topic || tx_topics_count >= MQTTD_MAX_TOPICS || topic_exists_tx(topic)) return false;
+    if (!topic) return false;
+    if (topic_exists_tx(topic)) {
+        ESP_LOGW(TAG, "TX topic already registered: %s", topic);
+        return false;
+    }
+    if (tx_topics_count >= MQTTD_MAX_TOPICS) {
+        ESP_LOGE(TAG, "Cannot add TX topic, limit reached (%d): %s", MQTTD_MAX_TOPICS, topic);
+        return false;
+    }
     char* dup = safe_strdup(topic);
     if (!dup) {
         ESP_LOGE(TAG, "Failed to allocate memory for TX topic: %s", topic);
         return false;
     }
     tx_topics[tx_topics_count].topic = dup;
+    tx_topics[tx_topics_count].type = TYPE_CHAR;
     tx_topics_count++;
     return true;
 }
@@ -109,13 +118,22 @@ bool mqttd_add_tx_topic(const char* topic) {
 
 // Добавить исходящий топик с типом
 bool mqttd_add_tx_topic_ex(const char* topic, mqttd_tx_type_t type) {
-    if (!topic || tx_topics_count >= MQTTD_MAX_TOPICS || topic_exists_tx(topic)) return false;
+    if (!topic) return false;
+    if (topic_exists_tx(topic)) {
+        ESP_LOGW(TAG, "TX topic already registered: %s", topic);
+        return false;
+    }
+    if (tx_topics_count >= MQTTD_MAX_TOPICS) {
+        ESP_LOGE(TAG, "Cannot add TX topic, limit reached (%d): %s", MQTTD_MAX_TOPICS, topic);
+        return false;
+    }
     char* dup = safe_strdup(topic);
     if (!dup) {
         ESP_LOGE(TAG, "Failed to allocate memory for TX topic: %s", topic);
         return false;
     }
     tx_topics[tx_topics_count].topic = dup;
+    tx_topics[tx_topics_count].type = type;
     tx_topics_count++;
     return true;
 }
@@ -250,34 +268,20 @@ void mqttd_stop(void)
      switch (type) {
          case TYPE_INT:
              snprintf(buf, sizeof(buf), "%d", *(int*)value);
-             // mqttd_publish_int(topic, *(int*)value);
              break;
          case TYPE_FLOAT:
              snprintf(buf, sizeof(buf), "%.2f", *(float*)value);
-             // mqttd_publish_float(topic, *(float*)value);
              break;
          case TYPE_CHAR:
              snprintf(buf, sizeof(buf), "%s", (const char*)value);
-             // mqttd_publish_str(topic, (const char*)value);
              break;
          default:
              return;
      }
-     esp_mqtt_client_publish(mqtt_client, topic, buf, 0, 1, 0);
- }
-
-// Публикация по типу
-/*bool mqttd_publish_status(const char* topic, bool online)
-{
-    if (!mqtt_client || !topic) return false;
-    int found = 0;
-    for (int i = 0; i < tx_topics_count; ++i) {
-        if (strcmp(tx_topics[i].topic, topic) == 0) { found = 1; break; }
+    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, buf, strlen(buf), 1, 0);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "Failed to publish to %s: %s", topic, buf);
     }
-    if (!found) return false;
-    const char* msg = online ? "online" : "offline";
-    int msg_id = esp_mqtt_client_publish(mqtt_client, topic, msg, 0, 1, 1);
-    return msg_id >= 0;
 }
 
 
@@ -293,7 +297,7 @@ bool mqttd_publish_mode(const char* topic, bool on)
     const char* msg = on ? "on" : "off";
     int msg_id = esp_mqtt_client_publish(mqtt_client, topic, msg, 0, 1, 0);
     return msg_id >= 0;
-}*/
+}
 
 // Публикация строкового значения
 bool mqttd_publish_str(const char* topic, const char* str)

@@ -74,6 +74,8 @@ extern "C" {
 
 #define CONFIG_MQTT_CLIENT_ID   "greenhouse_controller"
 
+#define MQTTD_MAX_TOPICS 25   // Максимальное количество топиков должно быть меньше 25
+
 // Топики
 #define CONFIG_TOPIC_STATUS       "greenhouse/status"
 #define CONFIG_TOPIC_TEMP         "greenhouse/temperature"
@@ -220,7 +222,7 @@ extern "C" {
 #define FILL_TANK_START_HOUR  10    // Начало заправки бака
 #define FILL_TANK_END_HOUR    16    // Окончание заправки
 
-#define IRRIGATION_DURATION_S 600  // 10 минут полива
+#define IRRIGATION_DURATION_S 1800  // 30 минут полива
 #define DEFAULT_IRRIGATION_PUMP_SPEED 100 // % мощности насоса во время полива
 
 // ========================================
