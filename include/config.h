@@ -201,20 +201,20 @@ extern "C" {
 #define WATER_LEVEL_STEPS 10  // Количество герконов
 
 // Напряжения для каждого шага (в мВ)
-#define WATER_LEVEL_STEP_0_MV    860   // 0%
-#define WATER_LEVEL_STEP_1_MV    930   // 10%
-#define WATER_LEVEL_STEP_2_MV   1010   // 20%
-#define WATER_LEVEL_STEP_3_MV   1100   // 30%
-#define WATER_LEVEL_STEP_4_MV   1210   // 40%
-#define WATER_LEVEL_STEP_5_MV   1350   // 50%
-#define WATER_LEVEL_STEP_6_MV   1520   // 60%
-#define WATER_LEVEL_STEP_7_MV   1740   // 70%
-#define WATER_LEVEL_STEP_8_MV   2030   // 80%
-#define WATER_LEVEL_STEP_9_MV   2450   // 100%
+#define WATER_LEVEL_STEP_0_MV    935   // 0%
+#define WATER_LEVEL_STEP_1_MV    954   // 10%
+#define WATER_LEVEL_STEP_2_MV   1050   // 20%
+#define WATER_LEVEL_STEP_3_MV   1120   // 30%
+#define WATER_LEVEL_STEP_4_MV   1220   // 40%
+#define WATER_LEVEL_STEP_5_MV   1420   // 50%
+#define WATER_LEVEL_STEP_6_MV   1550   // 60%
+#define WATER_LEVEL_STEP_7_MV   1770   // 70%
+#define WATER_LEVEL_STEP_8_MV   2070   // 80%
+#define WATER_LEVEL_STEP_9_MV   2500   // 100%
 
 #define WATER_LEVEL_DEADZONE_MV      810   // Мертвая зона датчика (между герконами)
-#define WATER_LEVEL_NORMAL_FULL_MV  2450   // Максимум при нормальном считывании (100%)
-#define WATER_LEVEL_FILL_MAX_MV     3080   // Максимум при наполнении бака (гистерезис)
+#define WATER_LEVEL_NORMAL_FULL_MV  2500   // Максимум при нормальном считывании (100%)
+#define WATER_LEVEL_FILL_MAX_MV     2500   // Максимум при наполнении бака (гистерезис)
 #define WATER_LEVEL_STEP_TOLERANCE_MV 50   // Допуск ±5% для определения шага (учет погрешности резисторов)
 #define WATER_LEVEL_SENSOR_DISCONNECTED_MV 100  // Порог отключения датчика
 
@@ -224,6 +224,7 @@ extern "C" {
 
 #define IRRIGATION_DURATION_S 1800  // 30 минут полива
 #define DEFAULT_IRRIGATION_PUMP_SPEED 100 // % мощности насоса во время полива
+#define CONFIG_IRRIG_PRESSURE_SETTLE_TIME_MS   3000  // 1.5 секунды на набор давления
 
 // ========================================
 // === Логгирование =======================

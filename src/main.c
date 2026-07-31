@@ -1,4 +1,5 @@
 /**
+ *  Версия 1.1
  * @file main.c
  * @brief Управление форточкой теплицы по температуре
  *
@@ -8,6 +9,8 @@
  * - Контроль тока двигателя (ACS712)
  * - Подключение к Wi-Fi, NTP, MQTT
  * - Публикация данных и приём команд
+ * - Полив грядок через команды с mqtt брокера
+ * - 
  */
 
 #include "../include/config.h"
@@ -27,7 +30,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <limits.h>
-#include "cJSON.h"
 
 
 
@@ -83,6 +85,9 @@ static bool g_tank_fill_manual_requested = false;  // Запрос ручног�
 float g_temperature = 0.0f;
 float g_humidity = 0.0f;
 bool g_vent_open = false;  // положение форточки (для MQTT)
+
+// Новая переменная для усреднённого уровня воды (в мВ)
+static int g_water_level_median_mv = -1;  // -1 означает "не измерено"
 
 // Флаги состояния сети
 bool g_wifi_connected = false;
@@ -181,24 +186,38 @@ static esp_err_t init_water_level_sensor(void) {
     return ESP_OK;
 }
 
+
 /**
- * @brief Считывает напряжение датчика уровня воды в мВ
- * @return Напряжение в мВ, -1 при ошибке чтения ADC
+ * @brief Считывает мгновенное напряжение с датчика уровня воды (ADC) в мВ
+ * @return Напряжение в мВ, -1 при ошибке
  */
 static int read_water_level_voltage_mv(void) {
-    int raw;
-    if (adc_oneshot_read(g_adc1_handle, WATER_LEVEL_ADC_CHAN, &raw) != ESP_OK) {
-        ESP_LOGW(MAIN_TAG, "Ошибка чтения ADC уровня воды");
+    if (!g_adc1_handle) {
+        ESP_LOGE(MAIN_TAG, "ADC1 handle не инициирован");
         return -1;
     }
 
-    int voltage_mv;
+    int raw = 0;
+    if (adc_oneshot_read(g_adc1_handle, WATER_LEVEL_ADC_CHAN, &raw) != ESP_OK) {
+        ESP_LOGE(MAIN_TAG, "Ошибка чтения ADC для уровня воды");
+        return -1;
+    }
+
+    // Преобразуем raw → мВ через калибровку
+    int voltage_mv = 0;
     if (adc_cali_raw_to_voltage(g_cali_handle, raw, &voltage_mv) != ESP_OK) {
-        ESP_LOGW(MAIN_TAG, "Ошибка калибровки ADC");
+        ESP_LOGE(MAIN_TAG, "Ошибка перевода raw в мВ");
         return -1;
     }
 
     return voltage_mv;
+}
+/**
+ * @brief Возвращает усреднённый уровень воды (медиана) в мВ
+ * @return Уровень в мВ, -1 при ошибке или пока не измерено
+ */
+static int read_water_level_median_mv(void) {
+    return g_water_level_median_mv;
 }
 
 /**
@@ -206,15 +225,15 @@ static int read_water_level_voltage_mv(void) {
  * @return Шаг (0-9), -1 при отключенном датчике или ошибке
  */
 static int read_water_level_step(void) {
-    int voltage_mv = read_water_level_voltage_mv();
-    ESP_LOGI(MAIN_TAG, "Уровень бака в: %d mV", voltage_mv);
+    int voltage_mv = read_water_level_median_mv();
+    
     
     if (voltage_mv < 0) {
         return -1;  // Ошибка чтения ADC
     }
 
     if (voltage_mv <= WATER_LEVEL_SENSOR_DISCONNECTED_MV) {
-        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (напряжение %d мВ < %d мВ)",
+        ESP_LOGW(MAIN_TAG, "Датчик уровня воды отключен (напряжение %d мВ ≤ %d мВ)",
                  voltage_mv, WATER_LEVEL_SENSOR_DISCONNECTED_MV);
         return -1;  // Датчик отключен
     }
@@ -227,10 +246,10 @@ static int read_water_level_step(void) {
         }
         // Если предыдущего значения нет, считаем это полным баком
         g_previous_water_level_percent = 100;
-        return 10;
+        return 9;  // Шаг 9 соответствует 100%
     }
 
-    // Массив напряжений для каждого шага
+    // Массив напряжений для каждого шага (0..9)
     static const int step_voltages[WATER_LEVEL_STEPS] = {
         WATER_LEVEL_STEP_0_MV,
         WATER_LEVEL_STEP_1_MV,
@@ -244,37 +263,26 @@ static int read_water_level_step(void) {
         WATER_LEVEL_STEP_9_MV
     };
 
-    // Определяем ближайший шаг с учетом допуска
-    int best_step = -1;
-    int best_diff = INT_MAX;
+    // Определяем ближайший шаг по абсолютной разнице (простое округление)
+    int best_step = 0;
+    int best_diff = abs(voltage_mv - step_voltages[0]);
 
-    for (int step = 0; step < WATER_LEVEL_STEPS; step++) {
+    for (int step = 1; step < WATER_LEVEL_STEPS; step++) {
         int diff = abs(voltage_mv - step_voltages[step]);
-        
-        // Если напряжение в пределах допуска - немедленно определяем шаг
-        if (diff <= WATER_LEVEL_STEP_TOLERANCE_MV) {
-            best_step = step;
-            best_diff = diff;
-            break;  // Нашли точное совпадение, больше не ищем
-        }
-
-        // Иначе находим ближайший шаг
         if (diff < best_diff) {
             best_diff = diff;
             best_step = step;
         }
     }
 
-    if (best_step >= 0) {
-        ESP_LOGD(MAIN_TAG, "Напряжение: %d мВ → Шаг %d (%d%%)", 
-                 voltage_mv, best_step, best_step * 10);
-        g_previous_water_level_percent = best_step * 10;
-        return best_step;
-    }
+    // Ограничим шаг диапазоном [0, 9]
+    if (best_step < 0) best_step = 0;
+    if (best_step > 9) best_step = 9;
 
-    // Если напряжение вне диапазона, логируем ошибку
-    ESP_LOGW(MAIN_TAG, "Неожиданное напряжение датчика: %d мВ", voltage_mv);
-    return -1;
+    ESP_LOGD(MAIN_TAG, "Напряжение: %d мВ → Шаг %d (%d%%)", 
+             voltage_mv, best_step, best_step * 10);
+    g_previous_water_level_percent = best_step * 10;
+    return best_step;
 }
 
 /**
@@ -322,25 +330,6 @@ static int get_garden_valve_gpio(int bed_index) {
 
 static void start_pump(int duty_percent);
 static void stop_pump(void);
-
-// Ручной полив грядки (10 минут) для заданного индекса грядки
-/*static void water_garden_bed_manual(int bed_index) {
-    int valve_gpio = get_garden_valve_gpio(bed_index);
-    ESP_LOGI("IRRIG", "Грядка %d: ручной полив 10 минут", bed_index + 1);
-    open_valve(valve_gpio);
-    start_pump(g_irrigation_pump_speed);
-
-    for (int elapsed = 0; elapsed < GARDEN_IRRIGATION_MANUAL_DURATION_S; ++elapsed) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if ((elapsed + 1) % 60 == 0) {
-            ESP_LOGD("IRRIG", "Грядка %d: ручной полив, прошло %d мин", bed_index + 1, (elapsed + 1) / 60);
-        }
-    }
-
-    stop_pump();
-    close_valve(valve_gpio);
-    ESP_LOGI("IRRIG", "Грядка %d: завершён ручной полив (10 минут)", bed_index + 1);
-}*/
 
 
 /**
@@ -438,25 +427,36 @@ static uint8_t parse_irrigation_command(const char* cmd) {
 }
 
 /**
- * @brief Применяет маску к грядкам: открывает/закрывает клапаны согласно маске
+ * @brief Применяет маску к грядкам: открывает/закрывает клапаны согласно маске.
+ * Сначала включает насос, ждёт набора давления, затем управляет клапанами.
  */
 static void apply_irrigation_mask(uint8_t mask) {
     char beds_str[16];
     mask_to_string(mask, beds_str, sizeof(beds_str));
     ESP_LOGI("IRRIG", "Применение маски полива: грядки %s", beds_str);
-    
-    for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-        int gpio = get_garden_valve_gpio(bed);
-        if (mask & (1 << bed)) {
-            open_valve(gpio);
-        } else {
-            close_valve(gpio);
-        }
-    }
-    // Если хотя бы одна грядка в маске — включаем насос, иначе выключаем
+
+    // === Сначала включаем насос ===
     if (mask != 0) {
         start_pump(g_irrigation_pump_speed);
+
+        // === Ждём набора давления (важно для гидравлического удара) ===
+       // vTaskDelay(pdMS_TO_TICKS(CONFIG_IRRIG_PRESSURE_SETTLE_TIME_MS));  // или IRRIG_PRESSURE_SETTLE_TIME_MS из config.h
+
+        // === Теперь открываем/закрываем клапаны ===
+        for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
+            int gpio = get_garden_valve_gpio(bed);
+            if (mask & (1 << bed)) {
+                open_valve(gpio);
+            } else {
+                close_valve(gpio);
+            }
+        }
     } else {
+        // === Выключение: сначала клапаны, потом насос ===
+        for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
+            int gpio = get_garden_valve_gpio(bed);
+            close_valve(gpio);
+        }
         stop_pump();
     }
 }
@@ -480,20 +480,7 @@ static void stop_tank_fill(void) {
     ESP_LOGI("IRRIG", "Наполнение бака остановлено");
 }
 
-/**
- * @brief Проверяет, достиг ли бак максимума при наполнении (3080 мВ)
- * @return true если бак полный (напряжение >= 3080 мВ с допуском)
- */
-static bool is_tank_fill_complete(void) {
-    int voltage_mv = read_water_level_voltage_mv();
-    
-    if (voltage_mv < 0) {
-        return false;  // Ошибка чтения
-    }
-    
-    // Проверяем достижение максимума при наполнении (3080 мВ ±50 мВ)
-    return (voltage_mv >= (WATER_LEVEL_FILL_MAX_MV - WATER_LEVEL_STEP_TOLERANCE_MV));
-}
+
 /* ========================================================================
  * Вспомогательные функции
  * ======================================================================== */
@@ -647,7 +634,7 @@ static void irrigation_task(void *arg) {
                 }
                 
                 // Проверяем достижение максимума
-                if (is_tank_fill_complete()) {
+                if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
                     ESP_LOGI("IRRIG", "Ручное наполнение завершено: максимальный уровень достигнут");
                     fill_complete = true;
                     break;
@@ -672,9 +659,9 @@ static void irrigation_task(void *arg) {
 
         // 🔹 Наполнение бака днём (если ещё не заполняли и уровень низкий)
         int level = read_water_level_percent();
-        if (!g_tank_filled &&
+        if (!g_tank_filled &&  // Бак ещё не заполняли сегодня
             hour >= g_fill_tank_start_hour && hour <= g_fill_tank_end_hour &&
-            level >= 0 && level < 20) {
+            level >= 0 && level < 100) {
             ESP_LOGI("IRRIG", "Запуск наполнения бака (уровень %d%%)", level);
             start_tank_fill();
 
@@ -694,9 +681,9 @@ static void irrigation_task(void *arg) {
                     break;
                 }
                 
-                // Проверяем достижение максимума при наполнении (3080 мВ)
-                if (is_tank_fill_complete()) {
-                    ESP_LOGI("IRRIG", "Бак заполнен до максимума (3080 мВ), текущий уровень %d%%", current_level);
+                // Проверяем достижение максимума при наполнении (2500 мВ)
+                if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
+                    ESP_LOGI("IRRIG", "Бак заполнен до максимума (2500 мВ), текущий уровень %d%%", current_level);
                     fill_complete = true;
                     break;
                 }
@@ -760,6 +747,63 @@ static void irrigation_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+/**
+ * @brief Задача мониторинга уровня воды с фильтрацией шумов
+ */
+static void water_level_monitor_task(void *arg) {
+    while (1) {
+        const int N_SAMPLES = 5;
+        int samples[N_SAMPLES];
+
+        // Считываем несколько значений
+        for (int i = 0; i < N_SAMPLES; i++) {
+            samples[i] = read_water_level_voltage_mv();  // ВАЖНО: это оригинальная функция (читает ADC напрямую)
+            if (samples[i] < 0) {
+                ESP_LOGW(MAIN_TAG, "Ошибка чтения ADC для мониторинга уровня");
+                g_water_level_median_mv = -1; // Ошибка — сбросим глобальную переменную
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50)); // Небольшая задержка между замерами
+        }
+
+        if (samples[0] < 0) {
+            // Пропускаем обработку, если ошибка на первом замере
+        } else {
+            // Сортировка массива (пузырьковая)
+            for (int i = 0; i < N_SAMPLES - 1; i++) {
+                for (int j = 0; j < N_SAMPLES - i - 1; j++) {
+                    if (samples[j] > samples[j + 1]) {
+                        int tmp = samples[j];
+                        samples[j] = samples[j + 1];
+                        samples[j + 1] = tmp;
+                    }
+                }
+            }
+
+            // Вычисляем медиану
+            int median = samples[N_SAMPLES / 2];
+
+            // Записываем в глобальную переменную
+            g_water_level_median_mv = median;
+
+            // Логируем редко (каждые 30 секунд)
+            static int counter = 0;
+            if (++counter >= 6) { // 6 * 5 сек = ~30 сек
+                char log_buf[128];
+                int len = snprintf(log_buf, sizeof(log_buf), "Уровень воды: [");
+                for (int i = 0; i < N_SAMPLES; i++) {
+                    len += snprintf(log_buf + len, sizeof(log_buf) - len, "%d ", samples[i]);
+                }
+                snprintf(log_buf + len - 1, sizeof(log_buf) - len + 1, "] → медиана=%d мВ", median);
+                ESP_LOGD(MAIN_TAG, "%s", log_buf);
+                counter = 0;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Обновление каждые 5 секунд
+    }
+    vTaskDelete(NULL);
+}
 /**
  * @brief Управление форточкой: открывает/закрывает по температуре
  */
@@ -1380,10 +1424,12 @@ void app_main() {
     mqttd_add_rx_topic(CONFIG_TOPIC_CONFIG_IRRIGATION_SPEED, mqtt_receive_callback);
 
     wifiStart();
+    // === Запуск задачи мониторинга уровня ===
+    xTaskCreate(water_level_monitor_task, "water_level_mon", 4096, NULL, 3, NULL);
      // === Запуск задачи полива ===
-    xTaskCreate(irrigation_task, "irrigation", 2048, NULL, 4, NULL);
+    xTaskCreate(irrigation_task, "irrigation", 4096, NULL, 4, NULL);
     // === Запуск задачи ежедневной синхронизации времени ===
     xTaskCreate(daily_sntp_task, "daily_sntp", 2048, NULL, 4, NULL);
     // === Запуск задачи публикации в MQTT ===
-    xTaskCreate(mqtt_publish_task, "mqtt_pub", 2048, NULL, 5, NULL);
+    xTaskCreate(mqtt_publish_task, "mqtt_pub", 4096, NULL, 5, NULL);
 }
