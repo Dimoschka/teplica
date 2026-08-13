@@ -35,7 +35,7 @@ esp_err_t irrigation_pump_init(void) {
 /**
  * @brief Включает насос с заданной мощностью
  */
-static bool irrigation_start_pump(int duty_percent) {
+static bool start_pump(int duty_percent) {
     if (g_pump_pwm == NULL) {
         ESP_LOGE(TAG, "PWM насоса не инициализирован");
         return false;
@@ -49,7 +49,7 @@ static bool irrigation_start_pump(int duty_percent) {
 /**
  * @brief Выключает насос
  */
-static void irrigation_stop_pump(void) {
+static void stop_pump(void) {
     pwm_load_set_duty(g_pump_pwm, 0);
     ESP_LOGI("IRRIG", "Насос выключен");
 }
@@ -58,7 +58,7 @@ static void irrigation_stop_pump(void) {
 /**
  * @brief Открывает клапан грядки
  */
-static void irrigation_open_valve(int gpio) {
+static void open_valve(int gpio) {
     gpio_set_level(gpio, 1);
     ESP_LOGI("IRRIG", "Клапан на GPIO%d открыт", gpio);
 }
@@ -66,13 +66,13 @@ static void irrigation_open_valve(int gpio) {
 /**
  * @brief Закрывает клапан
  */
-static void irrigation_close_valve(int gpio) {
+static void close_valve(int gpio) {
     gpio_set_level(gpio, 0);
     ESP_LOGI("IRRIG", "Клапан на GPIO%d закрыт", gpio);
 }
 
 // Получение GPIO для клапана грядки по индексу
-static int irrigation_get_valve_gpio(int bed_index) {
+static int get_valve_gpio(int bed_index) {
     switch (bed_index) {
         case 0: return VALVE_GARDEN1_GPIO;
         case 1: return VALVE_GARDEN2_GPIO;
@@ -170,26 +170,26 @@ void irrigation_apply_mask(uint8_t mask) {
 
     // === Сначала включаем насос ===
     if (mask != 0) {
-        irrigation_start_pump(g_irrigation_pump_speed);
+        start_pump(g_irrigation_pump_speed);
 
         // === Ждём набора давления (важно для гидравлического удара) ===
        // vTaskDelay(pdMS_TO_TICKS(CONFIG_IRRIG_PRESSURE_SETTLE_TIME_MS));  // или IRRIG_PRESSURE_SETTLE_TIME_MS из config.h
 
         // === Теперь открываем/закрываем клапаны ===
         for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-            int gpio = irrigation_get_valve_gpio(bed);
+            int gpio = get_valve_gpio(bed);
             if (mask & (1 << bed)) {
-                irrigation_open_valve(gpio);
+                open_valve(gpio);
             } else {
-                irrigation_close_valve(gpio);
+                close_valve(gpio);
             }
         }
     } else {
         // === Выключение: сначала клапаны, потом насос ===
         for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-            int gpio = irrigation_get_valve_gpio(bed);
-            irrigation_close_valve(gpio);
+            int gpio = get_valve_gpio(bed);
+            close_valve(gpio);
         }
-        irrigation_stop_pump();
+        stop_pump();
     }
 }
