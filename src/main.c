@@ -14,6 +14,7 @@
  */
 #include "app_state.h" // Типы и глобальные переменные
 #include "water_level/water_level.h" // Функции работы с датчиком уровня воды
+#include "irrigation/irrigation.h" // Функциии полива
 #include "../include/config.h"
 #include "pwm_load.h"
 #include "sht30.h"
@@ -38,186 +39,13 @@
  * Вспомогательные функции для полива
  * ======================================================================== */
 
-/**
- * @brief Инициализация насоса (PWM)
- */
-static esp_err_t init_water_pump(void) {
-    pwm_load_config_t pump_cfg = {
-        .gpio_pin = WATER_PUMP_GPIO,
-        .ledc_channel = LEDC_CHANNEL_1,
-        .ledc_timer = LEDC_TIMER_1,
-        .frequency = PUMP_PWM_FREQ_HZ,
-        .resolution_bits = PUMP_PWM_RES_BITS
-    };
-    g_pump_pwm = pwm_load_init(&pump_cfg);
-    if (!g_pump_pwm) {
-        ESP_LOGE(MAIN_TAG, "Не удалось инициализировать PWM насоса");
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
+
+
+//static void start_pump(int duty_percent);
+//static void stop_pump(void);
 
 
 
-
-/**
- * @brief Открывает клапан грядки
- */
-static void open_valve(int gpio) {
-    gpio_set_level(gpio, 1);
-    ESP_LOGI("IRRIG", "Клапан на GPIO%d открыт", gpio);
-}
-
-/**
- * @brief Закрывает клапан
- */
-static void close_valve(int gpio) {
-    gpio_set_level(gpio, 0);
-    ESP_LOGI("IRRIG", "Клапан на GPIO%d закрыт", gpio);
-}
-
-// Получение GPIO для клапана грядки по индексу
-static int get_garden_valve_gpio(int bed_index) {
-    switch (bed_index) {
-        case 0: return VALVE_GARDEN1_GPIO;
-        case 1: return VALVE_GARDEN2_GPIO;
-        case 2: return VALVE_GARDEN3_GPIO;
-        default: return VALVE_GARDEN1_GPIO;
-    }
-}
-
-static void start_pump(int duty_percent);
-static void stop_pump(void);
-
-
-/**
- * @brief Включает насос с заданной мощностью
- */
-static void start_pump(int duty_percent) {
-    int duty = CLAMP(duty_percent, 0, 100);
-    pwm_load_set_duty(g_pump_pwm, duty);
-    ESP_LOGI("IRRIG", "Насос включён: %d%%", duty);
-}
-
-/**
- * @brief Выключает насос
- */
-static void stop_pump(void) {
-    pwm_load_set_duty(g_pump_pwm, 0);
-    ESP_LOGI("IRRIG", "Насос выключен");
-}
-
-/**
- * @brief Преобразует маску в строку вида "1,3" для публикации статуса
- */
-static void mask_to_string(uint8_t mask, char* buf, size_t size) {
-    if (mask == 0) {
-        snprintf(buf, size, "off");
-        return;
-    }
-    
-    int pos = 0;
-    for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-        if (mask & (1 << bed)) {
-            if (pos > 0) pos += snprintf(buf + pos, size - pos, ",");
-            pos += snprintf(buf + pos, size - pos, "%d", bed + 1);
-        }
-    }
-    if (pos == 0) {
-        snprintf(buf, size, "off");
-    }
-}
-
-/**
- * @brief Парсит строку команды полива (on_1, on_1-3, on_1,3, off) и возвращает маску грядок
- * @return Маска грядок (0 если команда невалидна или это off)
- */
-static uint8_t parse_irrigation_command(const char* cmd) {
-    uint8_t mask = 0;
-    
-    // Команда выключения
-    if (strcmp(cmd, "off") == 0) {
-        return 0;
-    }
-    
-    // Проверяем префикс "on_"
-    if (strncmp(cmd, "on_", 3) != 0) {
-        ESP_LOGW("IRRIG", "Неизвестная команда: %s", cmd);
-        return 0;
-    }
-    
-    const char* beds_str = cmd + 3; // Пропускаем "on_"
-    char temp[64];
-    strncpy(temp, beds_str, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = 0;
-    
-    char* saveptr = NULL;
-    char* token = strtok_r(temp, ",", &saveptr);
-    
-    while (token != NULL) {
-        // Проверяем формат "X-Y" (диапазон)
-        char* dash = strchr(token, '-');
-        if (dash != NULL) {
-            int start = atoi(token);
-            int end = atoi(dash + 1);
-            if (start >= 1 && end >= 1 && start <= GARDEN_BEDS_COUNT && end <= GARDEN_BEDS_COUNT && start <= end) {
-                for (int i = start; i <= end; ++i) {
-                    mask |= (1 << (i - 1));
-                }
-                ESP_LOGD("IRRIG", "Добавлен диапазон грядок %d-%d", start, end);
-            } else {
-                ESP_LOGW("IRRIG", "Некорректный диапазон: %s", token);
-            }
-        } else {
-            // Одна грядка
-            int bed = atoi(token);
-            if (bed >= 1 && bed <= GARDEN_BEDS_COUNT) {
-                mask |= (1 << (bed - 1));
-                ESP_LOGD("IRRIG", "Добавлена грядка %d", bed);
-            } else {
-                ESP_LOGW("IRRIG", "Некорректный номер грядки: %d", bed);
-            }
-        }
-        token = strtok_r(NULL, ",", &saveptr);
-    }
-    
-    return mask;
-}
-
-/**
- * @brief Применяет маску к грядкам: открывает/закрывает клапаны согласно маске.
- * Сначала включает насос, ждёт набора давления, затем управляет клапанами.
- */
-static void apply_irrigation_mask(uint8_t mask) {
-    char beds_str[16];
-    mask_to_string(mask, beds_str, sizeof(beds_str));
-    ESP_LOGI("IRRIG", "Применение маски полива: грядки %s", beds_str);
-
-    // === Сначала включаем насос ===
-    if (mask != 0) {
-        start_pump(g_irrigation_pump_speed);
-
-        // === Ждём набора давления (важно для гидравлического удара) ===
-       // vTaskDelay(pdMS_TO_TICKS(CONFIG_IRRIG_PRESSURE_SETTLE_TIME_MS));  // или IRRIG_PRESSURE_SETTLE_TIME_MS из config.h
-
-        // === Теперь открываем/закрываем клапаны ===
-        for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-            int gpio = get_garden_valve_gpio(bed);
-            if (mask & (1 << bed)) {
-                open_valve(gpio);
-            } else {
-                close_valve(gpio);
-            }
-        }
-    } else {
-        // === Выключение: сначала клапаны, потом насос ===
-        for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-            int gpio = get_garden_valve_gpio(bed);
-            close_valve(gpio);
-        }
-        stop_pump();
-    }
-}
 
 /**
  * @brief Включает наполнение бака
@@ -491,7 +319,7 @@ static void irrigation_task(void *arg) {
             // Если таймер установлен и истёк — форсированно выключаем полив
             if (g_irrigation_disconnect_deadline != 0 && now_check >= g_irrigation_disconnect_deadline) {
                 ESP_LOGW("IRRIG", "Таймер отключения полива истёк — выключаем полив");
-                apply_irrigation_mask(0);
+                irrigation_apply_mask(0);
                 g_irrigation_beds_mask = 0;
                 g_irrigation_disconnect_deadline = 0;
                 if (g_wifi_connected && g_mqtt_started) {
@@ -661,7 +489,7 @@ static void mqtt_publish_task(void *pvParameters) {
             mqttd_publish_type(CONFIG_TOPIC_IRRIG_LAST_TIME, TYPE_CHAR, last_time_str);
             // Публикация состояния полива (маска грядок: "1,3" или "off")
             char irrig_status[16];
-            mask_to_string(g_irrigation_beds_mask, irrig_status, sizeof(irrig_status));
+            irrigation_mask_to_string(g_irrigation_beds_mask, irrig_status, sizeof(irrig_status));
             mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, irrig_status);
             
             // === Публикация статуса наполнения бака ===
@@ -822,21 +650,21 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
     else if (strcmp(topic, CONFIG_TOPIC_IRRIG_CONTROL) == 0) {
         ESP_LOGI("IRRIG", "MQTT команда полива: %s", value);
         
-        uint8_t new_mask = parse_irrigation_command(value);
+        uint8_t new_mask = irrigation_parse_command(value);
         
         if (strcmp(value, "off") == 0) {
             // Явная команда выключения: очищаем маску и таймер
             g_irrigation_beds_mask = 0;
             g_irrigation_disconnect_deadline = 0;
-            apply_irrigation_mask(0);
+            irrigation_apply_mask(0);
             ESP_LOGI("IRRIG", "✓ Полив выключен (команда off)");
         } else if (new_mask != 0) {
             // Команда включения: применяем маску и сбрасываем таймер отключения
             g_irrigation_beds_mask = new_mask;
             g_irrigation_disconnect_deadline = 0;
-            apply_irrigation_mask(new_mask);
+            irrigation_apply_mask(new_mask);
             char beds_status[16];
-            mask_to_string(new_mask, beds_status, sizeof(beds_status));
+            irrigation_mask_to_string(new_mask, beds_status, sizeof(beds_status));
             ESP_LOGI("IRRIG", "✓ Полив включен для грядок: %s", beds_status);
             // === Зафиксировать полив сегодня ===
             g_irrigation_happened_today = true;
@@ -851,7 +679,7 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
         // Публикуем новый статус
         if (g_wifi_connected && g_mqtt_started) {
             char irrig_status[16];
-            mask_to_string(g_irrigation_beds_mask, irrig_status, sizeof(irrig_status));
+            irrigation_mask_to_string(g_irrigation_beds_mask, irrig_status, sizeof(irrig_status));
             mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, irrig_status);
         }
         return;
@@ -1080,7 +908,7 @@ void app_main() {
     if (water_level_init() != ESP_OK) return;
 
     // === Инициализация насоса ===
-    if (init_water_pump() != ESP_OK) return;
+    if (irrigation_pump_init() != ESP_OK) return;
     if (sht30_init(&sht30_dev, SHT30_I2C_PORT, SHT30_SDA_PIN, SHT30_SCL_PIN, SHT30_ADDR_DEFAULT) != ESP_OK) {
         ESP_LOGE(MAIN_TAG, "Failed to initialize SHT30");
         return;
