@@ -15,6 +15,7 @@
 #include "app_state.h" // Типы и глобальные переменные
 #include "water_level/water_level.h" // Функции работы с датчиком уровня воды
 #include "irrigation/irrigation.h" // Функциии полива
+#include "tank_fill/tank_fill.h" // Функиции наполения бака
 #include "../include/config.h"
 #include "pwm_load.h"
 #include "sht30.h"
@@ -34,37 +35,6 @@
 #include <limits.h>
 
 
-
-/* ========================================================================
- * Вспомогательные функции для полива
- * ======================================================================== */
-
-
-
-//static void start_pump(int duty_percent);
-//static void stop_pump(void);
-
-
-
-
-/**
- * @brief Включает наполнение бака
- */
-static void start_tank_fill(void) {
-    gpio_set_level(TANK_FILL_GPIO, 1);
-    g_tank_fill_state = TANK_FILL_IN_PROGRESS;
-    ESP_LOGI(MAIN_TAG, "💧 [БАКА] Начало наполнения бака");
-    ESP_LOGI("IRRIG", "Запуск наполнения бака");
-    mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "filling");
-}
-
-/**
- * @brief Останавливает наполнение бака
- */
-static void stop_tank_fill(void) {
-    gpio_set_level(TANK_FILL_GPIO, 0);
-    ESP_LOGI("IRRIG", "Наполнение бака остановлено");
-}
 
 
 /* ========================================================================
@@ -191,7 +161,7 @@ static void irrigation_task(void *arg) {
         // 🔹 Обработка ручного запроса наполнения бака
         if (g_tank_fill_manual_requested && g_tank_fill_state != TANK_FILL_IN_PROGRESS) {
             ESP_LOGI("IRRIG", "Запуск ручного наполнения бака");
-            start_tank_fill();
+           tank_fill_start();
 
             // Мониторинг ручного наполнения
             bool fill_complete = false;
@@ -203,7 +173,7 @@ static void irrigation_task(void *arg) {
                 // Проверяем флаг отмены (если пришла команда stop)
                 if (!g_tank_fill_manual_requested) {
                     ESP_LOGI("IRRIG", "Ручное наполнение остановлено пользователем");
-                    stop_tank_fill();
+                    tank_fill_stop();
                     g_tank_fill_state = TANK_FILL_IDLE;
                     ESP_LOGI(MAIN_TAG, "💧 [БАКА] Наполнение отменено (вручную)");
                     if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "idle");
@@ -233,7 +203,7 @@ static void irrigation_task(void *arg) {
             }
 
             if (fill_complete || !sensor_error) {
-                stop_tank_fill();
+                tank_fill_stop();
                 g_tank_fill_state = TANK_FILL_COMPLETE;
                 if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
                 ESP_LOGI("IRRIG", "Ручное наполнение завершено");
@@ -249,7 +219,7 @@ static void irrigation_task(void *arg) {
             hour >= g_fill_tank_start_hour && hour <= g_fill_tank_end_hour &&
             level >= 0 && level < 100) {
             ESP_LOGI("IRRIG", "Запуск наполнения бака (уровень %d%%)", level);
-            start_tank_fill();
+            tank_fill_start();
 
             // Мониторинг наполнения с контролем напряжения датчика
             bool fill_complete = false;
@@ -280,7 +250,7 @@ static void irrigation_task(void *arg) {
                 }
             }
 
-            stop_tank_fill();
+            tank_fill_stop();
             if (fill_complete && !sensor_error) {
                 g_tank_filled = true;
                 g_tank_fill_state = TANK_FILL_COMPLETE;
@@ -494,7 +464,7 @@ static void mqtt_publish_task(void *pvParameters) {
             
             // === Публикация статуса наполнения бака ===
             const char *tank_status = "idle";
-            if (g_tank_fill_state == TANK_FILL_IN_PROGRESS) {
+            if (tank_fill_is_in_progress()) {
                 tank_status = "filling";
             } else if (g_tank_fill_state == TANK_FILL_COMPLETE) {
                 tank_status = "complete";
@@ -605,7 +575,7 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
             ESP_LOGI("IRRIG", "Ручная команда: наполнить бак");
             
             // Проверяем текущее состояние
-            if (g_tank_fill_state == TANK_FILL_IN_PROGRESS) {
+            if (tank_fill_is_in_progress()) {
                 ESP_LOGW("IRRIG", "Наполнение бака уже в процессе, команда проигнорирована");
                 mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_already_running");
                 return;
@@ -625,7 +595,7 @@ void mqtt_receive_callback(const char* topic, const char* data, int data_len) {
         else if (strcmp(value, "stop_fill") == 0) {
             ESP_LOGI("IRRIG", "Ручная команда: остановить наполнение бака");
             g_tank_fill_manual_requested = false;
-            stop_tank_fill();
+            tank_fill_stop();
             g_tank_fill_state = TANK_FILL_IDLE;
             mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "idle");
         }
