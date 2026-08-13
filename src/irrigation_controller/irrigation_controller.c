@@ -14,173 +14,245 @@
 
 #include <time.h>
 
+static const char *TAG = "IRRIG_CTRL";
+
+
+// Функция сброса дневных флагов полива и наполнения бака
+static void reset_daily_flags(const struct tm *timeinfo) {
+            if (timeinfo == NULL) {
+            return;
+        }
+
+        if (timeinfo->tm_hour != 0 ||
+            timeinfo->tm_min != 0 ||
+            timeinfo->tm_sec >= 10) {
+            return;
+        }
+
+        g_tank_filled = false;
+        g_irrigation_happened_today = false;
+        g_last_irrigation_time = 0;
+
+        for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
+            g_garden_irrigation_done_today[bed] = 0;
+        }
+
+        ESP_LOGI(TAG, "Дневные флаги полива сброшены");
+    }
+
+// Функция публикации состояния наполнения бака через MQTT
+static void publish_tank_state(const char *state)
+    {
+        if (state == NULL) {
+            return;
+        }
+
+        if (!g_wifi_connected || !g_mqtt_started) {
+            return;
+        }
+
+        mqttd_publish_type(
+            CONFIG_TOPIC_TANK_FILL_STATE,
+            TYPE_CHAR,
+            state
+        );
+    }
+static void check_irrigation_connection_timeout(void)
+    {
+        if (g_irrigation_beds_mask == 0) {
+            return;
+        }
+
+        time_t now;
+        time(&now);
+
+        if ((!g_wifi_connected || !g_mqtt_started) &&
+            g_irrigation_disconnect_deadline == 0) {
+            g_irrigation_disconnect_deadline = now + 30 * 60;
+
+            ESP_LOGW(
+                TAG,
+                "Связь потеряна, полив будет отключён через 30 минут"
+            );
+        }
+
+        if (g_irrigation_disconnect_deadline != 0 &&
+            now >= g_irrigation_disconnect_deadline) {
+            ESP_LOGW(TAG, "Таймер отключения полива истёк");
+
+            irrigation_apply_mask(0);
+            g_irrigation_beds_mask = 0;
+            g_irrigation_disconnect_deadline = 0;
+        }
+    }
+// Функция обработки ручного наполнения бака    
+static void process_manual_tank_fill(void)
+    {
+        ESP_LOGI(TAG, "Запуск ручного наполнения бака");
+
+        tank_fill_start();
+
+        bool fill_complete = false;
+        bool sensor_error = false;
+
+        for (int i = 0; i < 600; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            if (!g_tank_fill_manual_requested) {
+                ESP_LOGI(TAG, "Ручное наполнение остановлено пользователем");
+                tank_fill_stop();
+                g_tank_fill_state = TANK_FILL_IDLE;
+                publish_tank_state("idle");
+                return;
+            }
+
+            int current_level = water_level_read_percent();
+
+            if (current_level < 0) {
+                ESP_LOGW(TAG, "Ошибка датчика уровня при ручном наполнении");
+
+                tank_fill_stop();
+                g_tank_fill_state = TANK_FILL_ERROR;
+                publish_tank_state("error_sensor");
+
+                g_tank_fill_manual_requested = false;
+                return;
+            }
+
+            if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
+                ESP_LOGI(TAG, "Бак заполнен");
+                fill_complete = true;
+                break;
+            }
+
+            if (i % 10 == 0) {
+                ESP_LOGD(
+                    TAG,
+                    "Ручное наполнение: %d%%, прошло %d сек",
+                    current_level,
+                    i
+                );
+            }
+        }
+
+        tank_fill_stop();
+        g_tank_fill_manual_requested = false;
+
+        if (fill_complete) {
+            g_tank_fill_state = TANK_FILL_COMPLETE;
+            publish_tank_state("complete");
+        } else if (!sensor_error) {
+            g_tank_fill_state = TANK_FILL_ERROR;
+            publish_tank_state("timeout");
+        }
+
+        g_tank_fill_state = TANK_FILL_IDLE;
+    } 
+// Функция обработки планового наполнения бака   
+static void process_scheduled_tank_fill(int hour)
+        {
+            int level = water_level_read_percent();
+
+            if (level < 0) {
+                ESP_LOGW(TAG, "Невозможно проверить уровень воды");
+                g_tank_fill_state = TANK_FILL_IDLE;
+                return;
+            }
+
+            if (g_tank_filled ||
+                hour < g_fill_tank_start_hour ||
+                hour > g_fill_tank_end_hour ||
+                level >= 100) {
+                return;
+            }
+
+            ESP_LOGI(
+                TAG,
+                "Запуск планового наполнения бака, уровень %d%%",
+                level
+            );
+
+            tank_fill_start();
+
+            bool fill_complete = false;
+            bool sensor_error = false;
+
+            for (int i = 0; i < 600; ++i) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+
+                int current_level = water_level_read_percent();
+
+                if (current_level < 0) {
+                    ESP_LOGW(TAG, "Ошибка датчика уровня при наполнении");
+
+                    tank_fill_stop();
+                    g_tank_fill_state = TANK_FILL_ERROR;
+                    publish_tank_state("error_sensor");
+
+                    sensor_error = true;
+                    break;
+                }
+
+                if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
+                    fill_complete = true;
+                    break;
+                }
+
+                if (i % 10 == 0) {
+                    ESP_LOGD(
+                        TAG,
+                        "Наполнение: %d%%, прошло %d сек",
+                        current_level,
+                        i
+                    );
+                }
+            }
+
+            // Гарантированно выключаем наполнение после цикла
+            tank_fill_stop();
+
+            if (fill_complete && !sensor_error) {
+                g_tank_filled = true;
+                g_tank_fill_state = TANK_FILL_COMPLETE;
+                publish_tank_state("complete");
+            } else if (sensor_error) {
+                g_tank_fill_state = TANK_FILL_ERROR;
+                publish_tank_state("error_sensor");
+            } else {
+                // Таймаут не считаем успешным заполнением
+                g_tank_fill_state = TANK_FILL_ERROR;
+                publish_tank_state("timeout");
+            }
+
+            g_tank_fill_state = TANK_FILL_IDLE;
+        }
+
 /* ========================================================================
  * Автоматическое наполнение бака
  * ======================================================================== */
 
-void irrigation_controller_task(void *arg) {
-    time_t now;
-    struct tm timeinfo;
+void irrigation_controller_task(void *arg)
+{
+    (void)arg;
 
     while (1) {
+        time_t now;
+        struct tm timeinfo;
+
         time(&now);
         localtime_r(&now, &timeinfo);
 
-        int hour = timeinfo.tm_hour;
-        int day_changed = (timeinfo.tm_min == 0 && timeinfo.tm_sec < 10);
+        reset_daily_flags(&timeinfo);
 
-        // Сброс флагов в начале дня
-        if (day_changed && hour == 0) {
-            g_tank_filled = false;
-            g_irrigation_happened_today = false;
-            g_last_irrigation_time = 0;
-            for (int bed = 0; bed < GARDEN_BEDS_COUNT; ++bed) {
-                g_garden_irrigation_done_today[bed] = 0;
-            }
-            ESP_LOGI("IRRIG", "Сброс флагов полива на новый день");
+        if (g_tank_fill_manual_requested &&
+            !tank_fill_is_in_progress()) {
+            process_manual_tank_fill();
         }
 
-        // 🔹 Обработка ручного запроса наполнения бака
-        if (g_tank_fill_manual_requested && g_tank_fill_state != TANK_FILL_IN_PROGRESS) {
-            ESP_LOGI("IRRIG", "Запуск ручного наполнения бака");
-           tank_fill_start();
+        process_scheduled_tank_fill(timeinfo.tm_hour);
+        check_irrigation_connection_timeout();
 
-            // Мониторинг ручного наполнения
-            bool fill_complete = false;
-            bool sensor_error = false;
-            
-            for (int i = 0; i < 600; i++) {  // Максимум 10 минут
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                
-                // Проверяем флаг отмены (если пришла команда stop)
-                if (!g_tank_fill_manual_requested) {
-                    ESP_LOGI("IRRIG", "Ручное наполнение остановлено пользователем");
-                    tank_fill_stop();
-                    g_tank_fill_state = TANK_FILL_IDLE;
-                    ESP_LOGI(MAIN_TAG, "💧 [БАКА] Наполнение отменено (вручную)");
-                    if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "idle");
-                    break;
-                }
-                
-                int current_level = water_level_read_percent();
-                if (current_level < 0) {
-                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время ручного наполнения");
-                    sensor_error = true;
-                    g_tank_fill_state = TANK_FILL_ERROR;
-                    if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_sensor");
-                    break;
-                }
-                
-                // Проверяем достижение максимума
-                if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
-                    ESP_LOGI("IRRIG", "Ручное наполнение завершено: максимальный уровень достигнут");
-                    fill_complete = true;
-                    break;
-                }
-                
-                // Логируем прогресс каждые 10 секунд
-                if (i % 10 == 0) {
-                    ESP_LOGD("IRRIG", "Ручное наполнение: уровень %d%%, прошло %d сек", current_level, i);
-                }
-            }
-
-            if (fill_complete || !sensor_error) {
-                tank_fill_stop();
-                g_tank_fill_state = TANK_FILL_COMPLETE;
-                if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
-                ESP_LOGI("IRRIG", "Ручное наполнение завершено");
-            }
-            
-            g_tank_fill_manual_requested = false;
-            g_tank_fill_state = TANK_FILL_IDLE;
-        }
-
-        // 🔹 Наполнение бака днём (если ещё не заполняли и уровень низкий)
-        int level = water_level_read_percent();
-        if (!g_tank_filled &&  // Бак ещё не заполняли сегодня
-            hour >= g_fill_tank_start_hour && hour <= g_fill_tank_end_hour &&
-            level >= 0 && level < 100) {
-            ESP_LOGI("IRRIG", "Запуск наполнения бака (уровень %d%%)", level);
-            tank_fill_start();
-
-            // Мониторинг наполнения с контролем напряжения датчика
-            bool fill_complete = false;
-            bool sensor_error = false;
-            
-            for (int i = 0; i < 600; i++) {  // Максимум 10 минут (600 сек)
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                
-                int current_level = water_level_read_percent();
-                if (current_level < 0) {
-                    ESP_LOGW("IRRIG", "Датчик уровня отключен во время наполнения бака");
-                    sensor_error = true;
-                    g_tank_fill_state = TANK_FILL_ERROR;
-                    if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "error_sensor");
-                    break;
-                }
-                
-                // Проверяем достижение максимума при наполнении (2500 мВ)
-                if (g_water_level_median_mv >= WATER_LEVEL_FILL_MAX_MV) {
-                    ESP_LOGI("IRRIG", "Бак заполнен до максимума (2500 мВ), текущий уровень %d%%", current_level);
-                    fill_complete = true;
-                    break;
-                }
-                
-                // Логируем прогресс каждые 10 секунд
-                if (i % 10 == 0) {
-                    ESP_LOGD("IRRIG", "Наполнение в процессе: уровень %d%%, прошло %d сек", current_level, i);
-                }
-            }
-
-            tank_fill_stop();
-            if (fill_complete && !sensor_error) {
-                g_tank_filled = true;
-                g_tank_fill_state = TANK_FILL_COMPLETE;
-                if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
-                ESP_LOGI("IRRIG", "Бак наполнен успешно");
-            } else if (sensor_error) {
-                ESP_LOGW("IRRIG", "Наполнение бака прервано: датчик отключен");
-            } else {
-                g_tank_filled = true;
-                g_tank_fill_state = TANK_FILL_COMPLETE;
-                if (g_wifi_connected && g_mqtt_started) mqttd_publish_type(CONFIG_TOPIC_TANK_FILL_STATE, TYPE_CHAR, "complete");
-                ESP_LOGI("IRRIG", "Бак наполнен (таймаут или неполный)");
-            }
-            g_tank_fill_state = TANK_FILL_IDLE;
-        } else if (level < 0) {
-            ESP_LOGW("IRRIG", "Невозможно проверить уровень воды: датчик отключен");
-            g_tank_fill_state = TANK_FILL_IDLE;
-        } else {
-            g_tank_fill_state = TANK_FILL_IDLE;
-        }
-
-        // 🔹 Режим ручного/командного полива
-        // Автополив по расписанию отключен: управление только по MQTT-командам (on_1, on_1-3, on_1,3, off)
-
-        // Мониторинг состояния связи и таймера автоматического отключения полива
-        if (g_irrigation_beds_mask != 0) {
-            time_t now_check;
-            time(&now_check);
-
-            // Если связь потеряна и таймер ещё не установлен — установить на 30 минут
-            if ((!g_wifi_connected || !g_mqtt_started) && g_irrigation_disconnect_deadline == 0) {
-                g_irrigation_disconnect_deadline = now_check + (30 * 60);
-                ESP_LOGW("IRRIG", "Связь потеряна — установлен таймер отключения полива через 30 минут (until %ld)", g_irrigation_disconnect_deadline);
-            }
-
-            // Если таймер установлен и истёк — форсированно выключаем полив
-            if (g_irrigation_disconnect_deadline != 0 && now_check >= g_irrigation_disconnect_deadline) {
-                ESP_LOGW("IRRIG", "Таймер отключения полива истёк — выключаем полив");
-                irrigation_apply_mask(0);
-                g_irrigation_beds_mask = 0;
-                g_irrigation_disconnect_deadline = 0;
-                if (g_wifi_connected && g_mqtt_started) {
-                    mqttd_publish_type(CONFIG_TOPIC_IRRIG_STATE, TYPE_CHAR, "off_timeout");
-                }
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Проверка каждые 5 секунд
-    }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    } 
     vTaskDelete(NULL);
 }
