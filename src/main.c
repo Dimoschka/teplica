@@ -12,7 +12,7 @@
  * - Полив грядок через команды с mqtt брокера
  * - 
  */
-
+#include "app_state.h" // Типы и глобальные переменные
 #include "../include/config.h"
 #include "pwm_load.h"
 #include "sht30.h"
@@ -32,104 +32,6 @@
 #include <limits.h>
 
 
-
-
-
-/* ========================================================================
- * Типы и структуры
- * ======================================================================== */
-
-/**
- * @brief Состояние форточки
- */
-typedef enum {
-    VENT_CLOSED,
-    VENT_OPENING,
-    VENT_OPEN,
-    VENT_CLOSING
-} vent_state_t;
-
-/**
- * @brief Состояние наполнения бака
- */
-typedef enum {
-    TANK_FILL_IDLE,          // Ожидание команды
-    TANK_FILL_IN_PROGRESS,   // Процесс наполнения
-    TANK_FILL_COMPLETE,      // Завершено успешно
-    TANK_FILL_ERROR          // Ошибка (датчик отключен)
-} tank_fill_state_t;
-
-/**
- * @brief Сообщение для задачи управления климатом
- */
-typedef struct {
-    float temperature;
-    float humidity;
-    bool force_update;  // Принудительное обновление
-} climate_data_t;
-
-
-/* ========================================================================
- * Глобальные переменные
- * ======================================================================== */
-
- // Данные датчиков
-
-static bool g_tank_filled = false;  // Флаг: бак заполнен сегодня
-static int g_previous_water_level_percent = -1;  // Последний валидный уровень воды
-static tank_fill_state_t g_tank_fill_state = TANK_FILL_IDLE;  // Состояние наполнения
-static bool g_tank_fill_manual_requested = false;  // Запрос ручного наполнения
-
-
-// Данные датчиков
-float g_temperature = 0.0f;
-float g_humidity = 0.0f;
-bool g_vent_open = false;  // положение форточки (для MQTT)
-
-// Новая переменная для усреднённого уровня воды (в мВ)
-static int g_water_level_median_mv = -1;  // -1 означает "не измерено"
-
-// Флаги состояния сети
-bool g_wifi_connected = false;
-bool g_mqtt_started = false;
-
-// Устройства
-static pwm_load_handle_t g_motor_pwm = NULL;
-static QueueHandle_t g_climate_queue = NULL;
-static TaskHandle_t g_ventilation_task_handle = NULL;
-
-// Драйверы
-static acs712_t current_sensor;
-static pwm_load_handle_t g_pump_pwm = NULL;
-static adc_oneshot_unit_handle_t g_adc1_handle = NULL;
-static adc_cali_handle_t g_cali_handle = NULL;
-static sht30_t sht30_dev;
-
-// Состояние форточки
-static vent_state_t g_vent_state = VENT_CLOSED;
-static bool g_vent_position = false;  // false = закрыто, true = открыто
-
-// Настраиваемые параметры (сохранение в NVS)
-static float g_vent_open_temp = DEFAULT_VENT_OPEN_TEMP;
-static float g_vent_close_temp = DEFAULT_VENT_CLOSE_TEMP;
-static int g_fill_tank_start_hour = DEFAULT_FILL_TANK_START_HOUR;
-static int g_fill_tank_end_hour = DEFAULT_FILL_TANK_END_HOUR;
-static int g_irrigation_duration_s = DEFAULT_IRRIGATION_DURATION_S;
-static int g_irrigation_pump_speed = DEFAULT_IRRIGATION_PUMP_SPEED;
-static int g_garden_irrigation_pct[GARDEN_BEDS_COUNT] = {DEFAULT_GARDEN_IRRIGATION_PCT, DEFAULT_GARDEN_IRRIGATION_PCT, DEFAULT_GARDEN_IRRIGATION_PCT};
-static int g_garden_irrigation_freq[GARDEN_BEDS_COUNT] = {DEFAULT_GARDEN_IRRIGATION_FREQ, DEFAULT_GARDEN_IRRIGATION_FREQ, DEFAULT_GARDEN_IRRIGATION_FREQ};
-static int g_garden_irrigation_done_today[GARDEN_BEDS_COUNT] = {0, 0, 0};
-static bool g_irrigation_happened_today = false;
-static time_t g_last_irrigation_time = 0;
-
-// Состояние ручного/командного полива
-static uint8_t g_irrigation_beds_mask = 0; // Маска активных грядок: бит 0=грядка1, бит 1=грядка2, бит 2=грядка3
-// Если >0 — временная метка (time_t) когда необходимо форсированно отключить полив
-static time_t g_irrigation_disconnect_deadline = 0;
-/*static void register_irrigation_event(void) {
-    time(&g_last_irrigation_time);
-    g_irrigation_happened_today = true;
-}*/
 
 /* ========================================================================
  * Вспомогательные функции для полива
