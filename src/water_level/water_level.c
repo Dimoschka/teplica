@@ -45,7 +45,7 @@ esp_err_t water_level_init(void) {
  * @brief Считывает мгновенное напряжение с датчика уровня воды (ADC) в мВ
  * @return Напряжение в мВ, -1 при ошибке
  */
-int water_level_read_voltage_mv(void) {
+static int water_level_read_voltage_mv(void) {
     if (!g_adc1_handle) {
         ESP_LOGE(MAIN_TAG, "ADC1 handle не инициирован");
         return -1;
@@ -72,7 +72,7 @@ int water_level_read_voltage_mv(void) {
  * @brief Определяет шаг уровня воды (0-9, где 0=пусто, 9=полно)
  * @return Шаг (0-9), -1 при отключенном датчике или ошибке
  */
-int water_level_read_step(void) {
+static int water_level_read_step(void) {
     int voltage_mv = g_water_level_median_mv;
     
     
