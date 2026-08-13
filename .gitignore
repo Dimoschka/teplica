@@ -7,4 +7,13 @@
 include/config.h  # Или конкретные файлы с паролями
 include/config_local.h
 *.env             # Если используете .env файлы
-secrets/          # Папка с секретамиbuild/
+secrets/          # Папка с секретами
+build/
+# Secrets and certificates
+main/certs/*.key
+main/certs/*private*
+*.pem
+
+# Local ESP-IDF configuration
+sdkconfig
+sdkconfig.old
