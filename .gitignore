@@ -7,4 +7,4 @@
 include/config.h  # Или конкретные файлы с паролями
 include/config_local.h
 *.env             # Если используете .env файлы
-secrets/          # Папка с секретами
+secrets/          # Папка с секретамиbuild/
