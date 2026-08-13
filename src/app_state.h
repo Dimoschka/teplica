@@ -16,6 +16,8 @@
 #include "acs712.h"
 #include "sht30.h"
 
+#include "tank_fill/tank_fill.h"
+
 typedef enum {
     VENT_CLOSED,
     VENT_OPENING,
@@ -25,12 +27,7 @@ typedef enum {
     VENT_UNKNOWN
 } vent_state_t;
 
-typedef enum {
-    TANK_FILL_IDLE,
-    TANK_FILL_IN_PROGRESS,
-    TANK_FILL_COMPLETE,
-    TANK_FILL_ERROR
-} tank_fill_state_t;
+
 
 typedef struct {
     float temperature;
