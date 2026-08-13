@@ -1,19 +1,26 @@
-.pio
+# PlatformIO
+.pio/
+
+# ESP-IDF generated files
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.*
+!sdkconfig.defaults
+
+# VS Code
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
-.vscode/ipch
-# В .gitignore добавьте:
-include/config.h  # Или конкретные файлы с паролями
-include/config_local.h
-*.env             # Если используете .env файлы
-secrets/          # Папка с секретами
-build/
-# Secrets and certificates
-main/certs/*.key
-main/certs/*private*
-*.pem
+.vscode/ipch/
 
-# Local ESP-IDF configuration
-sdkconfig
-sdkconfig.old
+# Local configuration and secrets
+include/config_local.h
+*.env
+.env
+.env.*
+secrets/
+
+# Private keys
+*.key
+*private*
